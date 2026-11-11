@@ -18,9 +18,10 @@ $history = new MessageHistory(50, 86_400, static function () use (&$now): int {
     return $now;
 });
 
-$first = $history->add('Alice', 'kept-for-24-hours');
+$first = $history->add('Alice', 'kept-for-24-hours', 'sender-alice');
 checkHistory(strlen($first['id']) === 32, 'Server message ID is not a 128-bit hexadecimal value.');
 checkHistory($first['sentAt'] === gmdate('c', $now), 'Message did not use server time.');
+checkHistory($first['senderId'] === 'sender-alice', 'History did not retain the server sender ID.');
 
 $now += 600;
 checkHistory(count($history->all()) === 1, 'A ten-minute-old message was removed too early.');
@@ -34,7 +35,7 @@ $capped = new MessageHistory(50, 86_400, static function () use (&$now): int {
 });
 
 for ($index = 1; $index <= 55; ++$index) {
-    $capped->add('LoadTest', sprintf('message-%02d', $index));
+    $capped->add('LoadTest', sprintf('message-%02d', $index), 'sender-load');
     ++$now;
 }
 

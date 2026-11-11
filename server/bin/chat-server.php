@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use PrivateChat\ChatRoom;
+use PrivateChat\AnonymousIdentity;
 use PrivateChat\ClientIpResolver;
 use PrivateChat\IpRateLimiter;
 use PrivateChat\OriginPolicy;
@@ -31,6 +32,10 @@ $ipLimiter = new IpRateLimiter(
     (int) $config['ip_concurrent_limit'], (int) $config['ip_state_ttl'],
     (int) $config['max_tracked_ips'],
 );
+$identities = new AnonymousIdentity(
+    (int) $config['identity_token_ttl_seconds'],
+    (int) $config['identity_token_max_bytes'],
+);
 
 $room = new ChatRoom(
     (int) $config['max_frame_bytes'], (int) $config['max_nickname_characters'],
@@ -41,7 +46,7 @@ $room = new ChatRoom(
     (int) $config['room_code_min_length'], (int) $config['room_code_max_length'],
     (int) $config['unjoined_timeout'], (int) $config['max_send_buffer_bytes'],
     (int) $config['connection_chat_limit'], (int) $config['connection_chat_window'],
-    $originPolicy, $ipResolver, $ipLimiter,
+    $originPolicy, $ipResolver, $ipLimiter, $identities,
 );
 
 $worker = new Worker('tcp://' . $config['listen']);

@@ -57,6 +57,8 @@ return [
     'max_send_buffer_bytes' => 524_288,
     'max_nickname_characters' => 24,
     'max_message_characters' => 2_000,
+    'identity_token_ttl_seconds' => 604_800,
+    'identity_token_max_bytes' => 512,
     'ip_connection_limit' => $envInt('CHAT_IP_CONNECTION_LIMIT', $isProduction ? 40 : 1_000),
     'ip_connection_window' => $envInt('CHAT_IP_CONNECTION_WINDOW', 60),
     'ip_join_limit' => $envInt('CHAT_IP_JOIN_LIMIT', $isProduction ? 30 : 1_000),

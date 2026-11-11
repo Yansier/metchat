@@ -63,8 +63,16 @@
               <label for="roomCode">房间暗号</label>
               <span>区分大小写</span>
             </div>
-            <input id="roomCode" name="roomCode" type="password" minlength="8" maxlength="64" pattern="[A-Za-z0-9_-]{8,64}" placeholder="8–64 位约定暗号" required autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="go" aria-describedby="roomCodeHint">
-            <p id="roomCodeHint" class="field-hint">仅支持英文字母、数字、下划线和连字符</p>
+            <div class="room-code-field">
+              <input id="roomCode" name="roomCode" type="password" minlength="8" maxlength="64" pattern="[A-Za-z0-9_-]{8,64}" placeholder="8–64 位约定暗号" required autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="go" aria-describedby="roomCodeHint roomCodeFeedback">
+              <button id="toggleRoomCodeButton" class="field-action" type="button" aria-pressed="false" aria-label="显示房间暗号">显示</button>
+            </div>
+            <div class="room-code-actions">
+              <button id="generateRoomCodeButton" class="utility-button" type="button">生成随机暗号</button>
+              <button id="copyRoomCodeButton" class="utility-button" type="button" disabled>复制暗号</button>
+            </div>
+            <p id="roomCodeHint" class="field-hint">仅支持英文字母、数字、下划线和连字符；随机暗号默认 24 位</p>
+            <p id="roomCodeFeedback" class="field-feedback" role="status" aria-live="polite"></p>
           </div>
 
           <button id="joinButton" class="join-submit" type="submit">
@@ -74,7 +82,7 @@
           <p id="joinError" class="form-error" role="alert" aria-live="assertive"></p>
         </form>
 
-        <p class="privacy-note privacy-note--join">暗号不会出现在网址中，也不会保存到浏览器存储。</p>
+        <p class="privacy-note privacy-note--join">暗号与聊天内容不会保存；仅在当前标签页会话中保存匿名身份凭证。</p>
       </div>
     </section>
 
@@ -136,6 +144,7 @@
   </main>
 
   <noscript>此聊天室需要启用 JavaScript。</noscript>
+  <script src="./room-code.js" defer></script>
   <script src="./app.js" defer></script>
 </body>
 </html>

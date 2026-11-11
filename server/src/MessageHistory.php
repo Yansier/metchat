@@ -14,7 +14,7 @@ use Closure;
 final class MessageHistory
 {
     /**
-     * @var list<array{id: string, nickname: string, text: string, sentAt: string, expires_at: int}>
+     * @var list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string, expires_at: int}>
      */
     private array $messages = [];
 
@@ -36,8 +36,8 @@ final class MessageHistory
         $this->clock = $clock ?? static fn (): int => time();
     }
 
-    /** @return array{id: string, nickname: string, text: string, sentAt: string} */
-    public function add(string $nickname, string $text): array
+    /** @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string} */
+    public function add(string $nickname, string $text, string $senderId): array
     {
         $now = ($this->clock)();
         $message = [
@@ -45,6 +45,7 @@ final class MessageHistory
             'nickname' => $nickname,
             'text' => $text,
             'sentAt' => gmdate('c', $now),
+            'senderId' => $senderId,
             'expires_at' => $now + $this->ttlSeconds,
         ];
 
@@ -60,7 +61,7 @@ final class MessageHistory
     /**
      * Expired messages are filtered immediately before every history read.
      *
-     * @return list<array{id: string, nickname: string, text: string, sentAt: string}>
+     * @return list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string}>
      */
     public function all(): array
     {
@@ -90,8 +91,8 @@ final class MessageHistory
     }
 
     /**
-     * @param array{id: string, nickname: string, text: string, sentAt: string, expires_at: int} $message
-     * @return array{id: string, nickname: string, text: string, sentAt: string}
+     * @param array{id: string, nickname: string, text: string, sentAt: string, senderId: string, expires_at: int} $message
+     * @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string}
      */
     private function toPublicMessage(array $message): array
     {
@@ -100,6 +101,7 @@ final class MessageHistory
             'nickname' => $message['nickname'],
             'text' => $message['text'],
             'sentAt' => $message['sentAt'],
+            'senderId' => $message['senderId'],
         ];
     }
 

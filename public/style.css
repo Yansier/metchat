@@ -379,6 +379,58 @@ input {
   border-radius: 12px;
 }
 
+.room-code-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.room-code-field input {
+  padding-right: 68px;
+}
+
+.field-action {
+  position: absolute;
+  right: 8px;
+  min-width: 48px;
+  min-height: 34px;
+  padding: 0 9px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border: 1px solid rgb(76 201 240 / 18%);
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.room-code-actions {
+  display: flex;
+  margin-top: 9px;
+  gap: 8px;
+}
+
+.utility-button {
+  min-height: 34px;
+  padding: 0 11px;
+  color: var(--muted-strong);
+  background: rgb(255 255 255 / 3%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 0.7rem;
+  font-weight: 680;
+}
+
+.utility-button:not(:disabled):hover,
+.field-action:hover {
+  color: var(--accent-strong);
+  border-color: rgb(76 201 240 / 32%);
+}
+
+.utility-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 input::placeholder,
 textarea::placeholder {
   color: #617386;
@@ -396,6 +448,22 @@ textarea:focus {
   color: var(--muted);
   font-size: 0.68rem;
   line-height: 1.5;
+}
+
+.field-feedback {
+  min-height: 1.4em;
+  margin: 5px 2px 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.field-feedback[data-tone="success"] {
+  color: var(--success);
+}
+
+.field-feedback[data-tone="error"] {
+  color: var(--danger);
 }
 
 .join-submit,
@@ -586,6 +654,31 @@ textarea:focus {
   flex-direction: column;
   align-items: flex-start;
   animation: message-in 180ms ease-out both;
+}
+
+.message--own {
+  margin-left: auto;
+  align-items: flex-end;
+}
+
+.message--own .message__meta {
+  text-align: right;
+}
+
+.message--own .message__nickname {
+  color: #86f4e2;
+}
+
+.message--own .message__body {
+  color: #eafffb;
+  background: linear-gradient(145deg, rgb(20 105 123 / 96%), rgb(16 75 94 / 98%));
+  border-color: rgb(90 226 224 / 24%);
+  border-radius: 15px 4px 15px 15px;
+  box-shadow: 0 8px 24px rgb(21 148 168 / 13%);
+}
+
+.message--neutral .message__nickname {
+  color: var(--muted-strong);
 }
 
 .message__meta {

@@ -2,7 +2,7 @@
 
 一个按共享暗号隔离房间、实时转发并在 PHP Workerman 进程内存中保留短期历史的轻量私人聊天室。每个房间最多保留最近 50 条、24 小时内的消息；不使用数据库、文件或浏览器持久化存储。Workerman 重启后所有房间和历史自然清空。
 
-前端采用无框架的深色响应式界面，包含明确的连接状态、历史加载状态、有限重连、主动退出、消息长度提示和“回到最新消息”。由于当前协议没有稳定用户 ID，消息统一使用中性气泡，不依据相同昵称推断消息归属。
+前端采用无框架的深色响应式界面，包含明确的连接状态、历史加载状态、有限重连、主动退出、消息长度提示和“回到最新消息”。服务端签发仅限当前浏览器标签页会话的匿名身份凭证，并为每个房间派生不同的公开 `senderId`，因此实时消息和恢复历史都能准确区分自己与其他人，而不依赖昵称。
 
 ## 目录
 
@@ -10,12 +10,14 @@
 private-ephemeral-chat/
 ├── public/                         # Nginx 唯一公开目录
 │   ├── index.html
+│   ├── room-code.js
 │   ├── style.css
 │   └── app.js
 ├── server/                         # 不可通过网站访问
 │   ├── bin/chat-server.php
 │   ├── config/chat.php
 │   ├── src/ChatRoom.php
+│   ├── src/AnonymousIdentity.php
 │   ├── src/ClientIpResolver.php
 │   ├── src/IpRateLimiter.php
 │   ├── src/MessageHistory.php
@@ -29,6 +31,7 @@ private-ephemeral-chat/
 │   └── nginx-private-chat.conf
 ├── tests/
 │   ├── integration.php
+│   ├── anonymous-identity.php
 │   ├── message-history.php
 │   ├── room-manager.php
 │   ├── security-integration.php
@@ -44,6 +47,7 @@ private-ephemeral-chat/
 
 ```json
 {"type":"join","nickname":"Alice","roomCode":"261110Achat"}
+{"type":"join","nickname":"Alice","roomCode":"261110Achat","identityToken":"可选的服务端签发凭证"}
 {"type":"chat","text":"你好"}
 {"type":"ping","ts":1234567890}
 {"type":"pong"}
@@ -51,13 +55,26 @@ private-ephemeral-chat/
 
 服务端发送 `join`、`history`、`chat`、`presence`、`error`、`pong`。成功加入后的顺序为：
 
-1. `join`：加入确认，包含非敏感 `roomId`，不回传完整暗号。
+1. `join`：加入确认，包含非敏感 `roomId`、房间专属 `senderId`、续期后的 `identityToken` 和凭证到期时间；完整暗号不会回传。
 2. `history`：从旧到新的有效历史快照。
 3. 后续 `chat`：实时消息。
 
-历史和实时消息都包含服务端生成的 `id`、`nickname`、`text`、`sentAt`。`chat` 只向当前房间广播，并权威回显给发送者；前端按服务器消息 ID 去重。
+历史和实时消息都包含服务端生成的 `id`、`nickname`、`text`、`sentAt`、`senderId`。`chat` 只向当前房间广播，并权威回显给发送者；前端按服务器消息 ID 去重，并只通过 `senderId` 判断左右气泡。旧格式消息缺少 `senderId` 时使用中性样式。
 
 暗号规则：8–64 位，只允许英文字母、数字、下划线和连字符，区分大小写。服务端只把暗号转换为带进程随机密钥的内部哈希，不把完整暗号写入消息、URL 或日志。
+
+加入页可以用 Web Crypto `crypto.getRandomValues()` 生成默认 24 位暗号。字符集正好兼容服务端规则，并使用拒绝采样避免取模偏差；生成操作只填入表单，不会自动加入或保存暗号。
+
+## 匿名临时身份
+
+- 首次加入时服务端生成 256 位随机匿名主体，并返回 HMAC-SHA-256 签名凭证。
+- 凭证默认有效 7 天，每次成功加入都会续期；无效、伪造、过期凭证会安全降级为新身份。
+- 签名密钥和 senderId 派生密钥均为 Worker 进程随机密钥，重启后旧凭证自动失效。
+- 服务端不保存身份档案；连接内只保留当前房间必要的 `senderId`。
+- 同一凭证在不同房间派生不同 `senderId`，不能跨房间关联，也不能替代房间暗号。
+- `identityToken` 只在自己的 join 确认中返回，不会进入聊天、历史、presence 或其他用户的响应。
+- 浏览器只在 `sessionStorage` 保存这一项凭证，不保存昵称、暗号、消息或历史；主动退出会删除凭证。
+- `sessionStorage` 是标签页会话存储，不是账户隔离。浏览器“复制标签页”或带 `opener` 打开的页面可能复制初始存储，因此持有凭证者可被视为同一匿名身份。
 
 ## 本地启动（Linux）
 
@@ -99,11 +116,12 @@ php server/bin/chat-server.php restart
 ```bash
 php tests/message-history.php
 php tests/room-manager.php
+php tests/anonymous-identity.php
 php tests/security-unit.php
 php tests/integration.php
 ```
 
-测试覆盖暗号大小写、跨房间实时/历史隔离、同昵称跨房间、每房间独立 50 条历史、过期房间清理、全员离线恢复、未加入越权、加入频率、房间/连接容量和进程重启清空。
+测试覆盖凭证签名/伪造/续期/过期/重启失效、同昵称身份分离、刷新身份恢复、昵称变更、房间专属 senderId、暗号大小写、跨房间实时/历史隔离、每房间独立 50 条历史、过期房间清理、未加入越权、限流和容量。
 
 验证 Workerman 重启清空历史：
 
@@ -133,6 +151,9 @@ powershell -ExecutionPolicy Bypass -File tests/static-checks.ps1
 10. 暂停 WebSocket 服务，观察最多三次指数退避和“重连失败”；恢复服务后使用手动重连。
 11. 使用非法暗号、已满房间及服务器连接已满场景，确认分别显示明确错误。
 12. 在桌面、360px Android Chrome、iPhone Safari 和常见内置浏览器检查无横向溢出；软键盘弹出后输入框、发送按钮仍可见。
+13. 连续点击随机暗号并确认每次只填入 24 位合法值，不会自动提交；验证复制成功、拒绝剪贴板权限后的手动选择提示和显示/隐藏按钮。
+14. 两个窗口使用相同昵称加入同一房间，确认双方消息仍分别左右显示；刷新其中一个窗口并重新加入，确认自己的历史仍靠右。
+15. 点击退出后在开发者工具中确认 `sessionStorage` 的匿名凭证已删除；确认其中没有暗号或消息正文。
 
 消息交互约定：Enter 发送，Shift+Enter 换行。客户端只显示服务端回显的消息，不做乐观伪发送，也不会自动重试未确认的消息。
 
@@ -163,7 +184,8 @@ php bin/chat-server.php start -d
 
 ## 临时历史边界
 
-- 没有数据库、消息文件、Redis 或浏览器存储 API。
+- 没有数据库、消息文件或 Redis；不使用浏览器存储保存暗号、消息或历史。
+- 浏览器存储的唯一例外是 `sessionStorage` 中的服务端签名匿名身份凭证；它不包含消息或房间暗号。
 - 房间状态只存在单 Worker 进程的 `RoomManager` 数组中。
 - 每个房间拥有独立 `MessageHistory`，最多 50 条。
 - 每 60 秒定时清理过期消息；每次返回历史前也会再次过滤。
@@ -181,6 +203,7 @@ php bin/chat-server.php start -d
 - 真实 IP 只在 TCP 对端属于显式可信代理时从 `X-Real-IP` 读取；其他情况下忽略转发头。
 - Workerman 在业务 JSON 解析前限制 WebSocket 包大小；JSON 深度、字段集合、消息字符数还会在应用层再次校验。
 - 客户端不能提交消息 ID、权威昵称、服务器时间或目标房间；带额外权威字段的聊天包会被拒绝。
+- 客户端提交的 `senderId` 会被严格字段白名单拒绝；身份凭证只允许出现在 join 中，并必须通过服务端签名校验。
 - 发送缓冲达到 512 KiB 时关闭慢客户端，防止单连接长期积压。
 - 日志只输出事件类型，不输出 IP、聊天正文、完整暗号或原始帧。`PrivacyWebsocket` 专门拦截 Workerman 会打印原始非法 opcode 帧的诊断分支。
 

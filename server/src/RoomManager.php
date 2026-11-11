@@ -104,13 +104,13 @@ final class RoomManager
         $this->releaseRoomIfEmpty($roomKey);
     }
 
-    /** @return array{id: string, nickname: string, text: string, sentAt: string} */
-    public function addMessage(string $roomKey, string $nickname, string $text): array
+    /** @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string} */
+    public function addMessage(string $roomKey, string $nickname, string $text, string $senderId): array
     {
-        return $this->room($roomKey)['history']->add($nickname, $text);
+        return $this->room($roomKey)['history']->add($nickname, $text, $senderId);
     }
 
-    /** @return list<array{id: string, nickname: string, text: string, sentAt: string}> */
+    /** @return list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string}> */
     public function history(string $roomKey): array
     {
         return $this->room($roomKey)['history']->all();

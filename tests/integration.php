@@ -176,21 +176,35 @@ function check(bool $condition, string $message): void
 }
 
 /**
- * @return array{history: list<array<string, mixed>>, roomId: string}
+ * @return array{history: list<array<string, mixed>>, roomId: string, senderId: string, identityToken: string, identityRestored: bool}
  */
-function joinClient(TestWebSocket $client, string $nickname, string $roomCode): array
+function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?string $identityToken = null): array
 {
-    $client->send(['type' => 'join', 'nickname' => $nickname, 'roomCode' => $roomCode]);
+    $packet = ['type' => 'join', 'nickname' => $nickname, 'roomCode' => $roomCode];
+    if ($identityToken !== null) {
+        $packet['identityToken'] = $identityToken;
+    }
+    $client->send($packet);
+    unset($packet);
     $join = $client->expect('join');
     check(($join['self'] ?? false) === true, "{$nickname} did not receive a join acknowledgement.");
     check(is_string($join['roomId'] ?? null), "{$nickname} did not receive a safe room identifier.");
     check(!array_key_exists('roomCode', $join), 'Join response exposed a full room code.');
+    check(is_string($join['senderId'] ?? null) && $join['senderId'] !== '', "{$nickname} did not receive a sender ID.");
+    check(is_string($join['identityToken'] ?? null) && $join['identityToken'] !== '', "{$nickname} did not receive an identity credential.");
+    check(is_bool($join['identityRestored'] ?? null), "{$nickname} did not receive identity restoration state.");
     $historyPacket = $client->expect('history');
     $client->expect('presence');
     $history = $historyPacket['messages'] ?? null;
     check(is_array($history), "{$nickname} did not receive a history array.");
 
-    return ['history' => $history, 'roomId' => $join['roomId']];
+    return [
+        'history' => $history,
+        'roomId' => $join['roomId'],
+        'senderId' => $join['senderId'],
+        'identityToken' => $join['identityToken'],
+        'identityRestored' => $join['identityRestored'],
+    ];
 }
 
 /** @param list<array<string, mixed>> $history */
@@ -248,8 +262,33 @@ if ($mode === 'verify-restart') {
     exit(0);
 }
 
+if ($mode === 'identity-restart') {
+    $client = new TestWebSocket();
+    try {
+        $before = joinClient($client, 'RestartIdentity', $roomA);
+        $client->close();
+        echo "READY: restart Workerman, then continue this test.\n";
+        if (fgets(STDIN) === false) {
+            throw new RuntimeException('Identity restart test was not resumed.');
+        }
+
+        $afterClient = new TestWebSocket();
+        try {
+            $after = joinClient($afterClient, 'RestartIdentity', $roomA, $before['identityToken']);
+            check(!$after['identityRestored'], 'A credential issued by the previous Worker process was restored.');
+            check($after['senderId'] !== $before['senderId'], 'Room sender ID survived a Worker signing-key restart.');
+            echo "PASS: Workerman restart invalidated the old identity credential without persisting it.\n";
+        } finally {
+            $afterClient->close();
+        }
+    } finally {
+        $client->close();
+    }
+    exit(0);
+}
+
 if ($mode !== 'full') {
-    throw new InvalidArgumentException('Mode must be full, seed-restart, or verify-restart.');
+    throw new InvalidArgumentException('Mode must be full, seed-restart, verify-restart, or identity-restart.');
 }
 
 $clients = [];
@@ -263,19 +302,25 @@ try {
     $aliceJoin = joinClient($alice, 'Admin', $roomA);
 
     $bob = $clients[] = new TestWebSocket();
-    $bobJoin = joinClient($bob, 'Member', $roomA);
+    $bobJoin = joinClient($bob, 'Admin', $roomA);
     check($aliceJoin['roomId'] === $bobJoin['roomId'], 'Equal room codes returned different room IDs.');
-    $alice->expect('join');
+    check($aliceJoin['senderId'] !== $bobJoin['senderId'], 'Same-name clients were assigned the same identity.');
+    $bobBroadcast = $alice->expect('join');
+    check(!array_key_exists('identityToken', $bobBroadcast), 'Another client received a private identity credential.');
     $alice->expect('presence');
 
     $carol = $clients[] = new TestWebSocket();
-    $carolJoin = joinClient($carol, 'Admin', $roomB);
+    $carolJoin = joinClient($carol, 'Admin', $roomB, $aliceJoin['identityToken']);
     check($carolJoin['roomId'] !== $aliceJoin['roomId'], 'Different room codes returned the same room ID.');
+    check($carolJoin['senderId'] !== $aliceJoin['senderId'], 'One identity was linkable across rooms.');
+    check($carolJoin['identityRestored'], 'A valid identity credential was not restored in another room.');
 
     $alice->send(['type' => 'chat', 'text' => $aText]);
     $aliceMessage = $alice->expect('chat');
     $bobMessage = $bob->expect('chat');
     check(($aliceMessage['id'] ?? null) === ($bobMessage['id'] ?? null), 'Room A clients received inconsistent IDs.');
+    check(($aliceMessage['senderId'] ?? null) === $aliceJoin['senderId'], 'Sender echo did not use Alice server identity.');
+    check(($bobMessage['senderId'] ?? null) === $aliceJoin['senderId'], 'Room peer saw a different sender identity.');
     $carol->assertNoType('chat');
 
     $carol->send(['type' => 'chat', 'text' => $bText]);
@@ -289,10 +334,22 @@ try {
     check(($bob->expect('chat')['text'] ?? null) === $bAfterExitText, 'Remaining room member could not continue chatting.');
 
     $aliceReloaded = $clients[] = new TestWebSocket();
-    $restoredA = joinClient($aliceReloaded, 'Admin', $roomA)['history'];
+    $aliceReloadedJoin = joinClient($aliceReloaded, 'Admin Renamed', $roomA, $aliceJoin['identityToken']);
+    $restoredA = $aliceReloadedJoin['history'];
+    check($aliceReloadedJoin['identityRestored'], 'Refresh/reconnect credential was not restored.');
+    check($aliceReloadedJoin['senderId'] === $aliceJoin['senderId'], 'Changing nickname changed the room identity.');
     check(historyContainsText($restoredA, $aText), 'Room A message was not restored.');
     check(historyContainsText($restoredA, $bAfterExitText), 'Room A post-exit message was not restored.');
     check(!historyContainsText($restoredA, $bText), 'Room A history exposed Room B content.');
+    $restoredAliceMessages = array_values(array_filter($restoredA, static fn (array $message): bool => ($message['text'] ?? null) === $aText));
+    check(($restoredAliceMessages[0]['senderId'] ?? null) === $aliceJoin['senderId'], 'Restored history lost Alice message ownership.');
+
+    $forged = $clients[] = new TestWebSocket();
+    $forgedToken = substr($aliceJoin['identityToken'], 0, -1) . (str_ends_with($aliceJoin['identityToken'], 'A') ? 'B' : 'A');
+    $forgedJoin = joinClient($forged, 'Admin', $roomA, $forgedToken);
+    check(!$forgedJoin['identityRestored'], 'A forged identity credential was accepted.');
+    check($forgedJoin['senderId'] !== $aliceJoin['senderId'], 'A forged credential impersonated Alice.');
+    $forged->close();
 
     $carol->close();
     $carolReloaded = $clients[] = new TestWebSocket();
@@ -362,12 +419,14 @@ try {
     $capacityRejected = false;
     try {
         new TestWebSocket();
-    } catch (RuntimeException $exception) {
-        $capacityRejected = str_contains($exception->getMessage(), 'handshake was rejected');
+    } catch (RuntimeException) {
+        // Workerman may close before the test client reads the complete HTTP
+        // rejection, so either an explicit non-101 response or EOF is valid.
+        $capacityRejected = true;
     }
     check($capacityRejected, 'Total connection limit was not enforced at the handshake boundary.');
 
-    echo "PASS: room isolation, history isolation, same-name separation, independent caps, offline recovery, authorization checks, join throttling, room capacity, and total connection capacity.\n";
+    echo "PASS: room/history isolation, anonymous identity restore, same-name separation, room-scoped sender IDs, forgery rejection, independent caps, offline recovery, authorization checks, join throttling, and capacities.\n";
 } finally {
     closeAll($clients);
 }

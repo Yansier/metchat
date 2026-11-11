@@ -36,16 +36,16 @@ checkRoom($full['status'] === RoomManager::ROOM_FULL, 'Per-room connection limit
 $roomLimit = $rooms->join('ThirdRoom_1', 5);
 checkRoom($roomLimit['status'] === RoomManager::ROOM_LIMIT_REACHED, 'Global room limit was not enforced.');
 
-$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-one');
-$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-two');
-$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-three');
+$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-one', 'sender-upper');
+$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-two', 'sender-upper');
+$rooms->addMessage($upperA['roomKey'], 'SharedName', 'upper-three', 'sender-upper');
 checkRoom(
     array_column($rooms->history($upperA['roomKey']), 'text') === ['upper-two', 'upper-three'],
     'First room did not independently retain its latest two messages.',
 );
 
 $now += 50;
-$rooms->addMessage($lower['roomKey'], 'SharedName', 'lower-valid');
+$rooms->addMessage($lower['roomKey'], 'SharedName', 'lower-valid', 'sender-lower');
 checkRoom(
     array_column($rooms->history($lower['roomKey']), 'text') === ['lower-valid'],
     'Second room history was contaminated by the first room.',

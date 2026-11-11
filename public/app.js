@@ -7,6 +7,10 @@
   const joinButton = document.querySelector("#joinButton");
   const nicknameInput = document.querySelector("#nickname");
   const roomCodeInput = document.querySelector("#roomCode");
+  const toggleRoomCodeButton = document.querySelector("#toggleRoomCodeButton");
+  const generateRoomCodeButton = document.querySelector("#generateRoomCodeButton");
+  const copyRoomCodeButton = document.querySelector("#copyRoomCodeButton");
+  const roomCodeFeedback = document.querySelector("#roomCodeFeedback");
   const joinError = document.querySelector("#joinError");
   const messageForm = document.querySelector("#messageForm");
   const messageInput = document.querySelector("#messageInput");
@@ -33,6 +37,8 @@
   const BOTTOM_THRESHOLD_PX = 96;
   const MAX_MESSAGE_CHARACTERS = 2_000;
   const ROOM_CODE_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+  const IDENTITY_TOKEN_STORAGE_KEY = "metchat.anonymousIdentityToken";
+  const MAX_IDENTITY_TOKEN_BYTES = 512;
   const DEFAULT_COMPOSER_HINT = "Enter 发送 · Shift + Enter 换行";
 
   const JOIN_ERROR_MESSAGES = {
@@ -49,6 +55,8 @@
   let nickname = "";
   let roomCode = "";
   let roomId = "";
+  let identityToken = readIdentityToken();
+  let currentSenderId = "";
   let joined = false;
   let heartbeatTimer = null;
   let reconnectTimer = null;
@@ -64,6 +72,33 @@
 
   // IDs exist only for this page lifetime and are never persisted.
   const seenMessageIds = new Set();
+
+  function readIdentityToken() {
+    try {
+      const value = window.sessionStorage.getItem(IDENTITY_TOKEN_STORAGE_KEY);
+      return typeof value === "string" && value.length <= MAX_IDENTITY_TOKEN_BYTES ? value : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function storeIdentityToken(token) {
+    identityToken = token;
+    try {
+      window.sessionStorage.setItem(IDENTITY_TOKEN_STORAGE_KEY, token);
+    } catch {
+      // The in-memory value still preserves identity during this page lifetime.
+    }
+  }
+
+  function clearIdentityToken() {
+    identityToken = "";
+    try {
+      window.sessionStorage.removeItem(IDENTITY_TOKEN_STORAGE_KEY);
+    } catch {
+      // Storage may be unavailable in a restricted browsing context.
+    }
+  }
 
   function websocketUrl() {
     const isLocal = location.hostname === "127.0.0.1" || location.hostname === "localhost";
@@ -148,6 +183,14 @@
       && typeof packet.sentAt === "string";
   }
 
+  function messageOwnership(packet) {
+    if (typeof packet.senderId !== "string" || !packet.senderId || !currentSenderId) {
+      return "neutral";
+    }
+
+    return packet.senderId === currentSenderId ? "own" : "other";
+  }
+
   function appendChat(packet, { autoScroll = true } = {}) {
     if (!isValidMessage(packet) || seenMessageIds.has(packet.id)) {
       return false;
@@ -155,7 +198,7 @@
 
     const shouldScroll = isNearBottom();
     const item = document.createElement("li");
-    item.className = "message";
+    item.className = `message message--${messageOwnership(packet)}`;
     item.dataset.messageId = packet.id;
 
     const meta = document.createElement("p");
@@ -334,6 +377,14 @@
     switch (packet.type) {
       case "join":
         if (packet.self === true) {
+          currentSenderId = typeof packet.senderId === "string" ? packet.senderId : "";
+          if (
+            typeof packet.identityToken === "string"
+            && packet.identityToken.length > 0
+            && packet.identityToken.length <= MAX_IDENTITY_TOKEN_BYTES
+          ) {
+            storeIdentityToken(packet.identityToken);
+          }
           joined = true;
           reconnectAttempts = 0;
           suppressReconnect = false;
@@ -432,7 +483,11 @@
         return;
       }
       startHeartbeat();
-      send({ type: "join", nickname, roomCode });
+      const joinPacket = { type: "join", nickname, roomCode };
+      if (identityToken) {
+        joinPacket.identityToken = identityToken;
+      }
+      send(joinPacket);
     });
     nextSocket.addEventListener("message", (event) => handleServerMessage(event, nextSocket));
     nextSocket.addEventListener("close", () => finishDisconnect(nextSocket));
@@ -472,10 +527,19 @@
     nickname = "";
     roomCode = "";
     roomId = "";
+    currentSenderId = "";
+    clearIdentityToken();
     reconnectAttempts = 0;
     focusAfterHistory = false;
     nicknameInput.value = "";
     roomCodeInput.value = "";
+    roomCodeInput.type = "password";
+    toggleRoomCodeButton.textContent = "显示";
+    toggleRoomCodeButton.setAttribute("aria-pressed", "false");
+    toggleRoomCodeButton.setAttribute("aria-label", "显示房间暗号");
+    copyRoomCodeButton.disabled = true;
+    roomCodeFeedback.textContent = "";
+    roomCodeFeedback.removeAttribute("data-tone");
     messageInput.value = "";
     messageInput.rows = 1;
     messageCount.textContent = `0 / ${MAX_MESSAGE_CHARACTERS}`;
@@ -538,6 +602,72 @@
       viewportFrame = null;
     });
   }
+
+  function setRoomCodeFeedback(message = "", tone = "neutral") {
+    roomCodeFeedback.textContent = message;
+    if (tone === "neutral") {
+      roomCodeFeedback.removeAttribute("data-tone");
+    } else {
+      roomCodeFeedback.dataset.tone = tone;
+    }
+  }
+
+  function revealAndSelectRoomCode() {
+    roomCodeInput.type = "text";
+    toggleRoomCodeButton.textContent = "隐藏";
+    toggleRoomCodeButton.setAttribute("aria-pressed", "true");
+    toggleRoomCodeButton.setAttribute("aria-label", "隐藏房间暗号");
+    roomCodeInput.focus({ preventScroll: true });
+    roomCodeInput.select();
+    roomCodeInput.setSelectionRange(0, roomCodeInput.value.length);
+  }
+
+  toggleRoomCodeButton.addEventListener("click", () => {
+    const shouldReveal = roomCodeInput.type === "password";
+    roomCodeInput.type = shouldReveal ? "text" : "password";
+    toggleRoomCodeButton.textContent = shouldReveal ? "隐藏" : "显示";
+    toggleRoomCodeButton.setAttribute("aria-pressed", String(shouldReveal));
+    toggleRoomCodeButton.setAttribute("aria-label", shouldReveal ? "隐藏房间暗号" : "显示房间暗号");
+    roomCodeInput.focus({ preventScroll: true });
+  });
+
+  generateRoomCodeButton.addEventListener("click", () => {
+    try {
+      const generated = window.MetChatRoomCode.generate();
+      roomCodeInput.value = generated;
+      copyRoomCodeButton.disabled = false;
+      joinError.textContent = "";
+      setRoomCodeFeedback("已生成 24 位随机暗号，请复制后安全地发送给朋友。", "success");
+      roomCodeInput.focus({ preventScroll: true });
+    } catch {
+      setRoomCodeFeedback("当前浏览器无法生成安全随机暗号，请手动输入。", "error");
+    }
+  });
+
+  copyRoomCodeButton.addEventListener("click", async () => {
+    const value = roomCodeInput.value;
+    if (!ROOM_CODE_PATTERN.test(value)) {
+      setRoomCodeFeedback("请先输入或生成有效暗号。", "error");
+      roomCodeInput.focus({ preventScroll: true });
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(value);
+      setRoomCodeFeedback("暗号已复制。", "success");
+    } catch {
+      revealAndSelectRoomCode();
+      setRoomCodeFeedback("浏览器未允许复制，暗号已选中，请按 Ctrl/Cmd+C 手动复制。", "error");
+    }
+  });
+
+  roomCodeInput.addEventListener("input", () => {
+    copyRoomCodeButton.disabled = roomCodeInput.value.length === 0;
+    setRoomCodeFeedback();
+  });
 
   joinForm.addEventListener("submit", (event) => {
     event.preventDefault();

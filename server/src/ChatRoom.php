@@ -12,7 +12,7 @@ use Workerman\Worker;
 
 final class ChatRoom
 {
-    /** @var array<int, array{connection: TcpConnection, nickname: ?string, room_key: ?string, connected_at: int, last_seen_at: int, join_attempts: int, handshake_authorized: bool, rate_key: ?string, rate_acquired: bool, chat_times: list<int>, rate_violations: int}> */
+    /** @var array<int, array{connection: TcpConnection, nickname: ?string, room_key: ?string, sender_id: ?string, connected_at: int, last_seen_at: int, join_attempts: int, handshake_authorized: bool, rate_key: ?string, rate_acquired: bool, chat_times: list<int>, rate_violations: int}> */
     private array $clients = [];
     private readonly RoomManager $rooms;
     private bool $shuttingDown = false;
@@ -37,6 +37,7 @@ final class ChatRoom
         private readonly OriginPolicy $originPolicy,
         private readonly ClientIpResolver $ipResolver,
         private readonly IpRateLimiter $ipLimiter,
+        private readonly AnonymousIdentity $identities,
     ) {
         $this->rooms = new RoomManager($maxRooms, $maxConnectionsPerRoom, $historyMaxMessages, $historyTtlSeconds);
     }
@@ -70,7 +71,7 @@ final class ChatRoom
         }
 
         $this->clients[$connection->id] = [
-            'connection' => $connection, 'nickname' => null, 'room_key' => null,
+            'connection' => $connection, 'nickname' => null, 'room_key' => null, 'sender_id' => null,
             'connected_at' => $now, 'last_seen_at' => $now, 'join_attempts' => 0,
             'handshake_authorized' => false, 'rate_key' => $rateKey, 'rate_acquired' => $rateAcquired,
             'chat_times' => [], 'rate_violations' => 0,
@@ -150,14 +151,17 @@ final class ChatRoom
             return;
         }
         unset($rawFrame);
-        if (!is_array($packet) || array_is_list($packet) || count($packet) > 3 || !isset($packet['type']) || !is_string($packet['type'])) {
+        if (!is_array($packet) || array_is_list($packet) || count($packet) > 4 || !isset($packet['type']) || !is_string($packet['type'])) {
             $this->sendError($connection, 'invalid_packet', '消息结构无效');
             return;
         }
 
         switch ($packet['type']) {
             case 'join':
-                if (!$this->hasOnlyKeys($packet, ['type', 'nickname', 'roomCode'])) {
+                if (
+                    !$this->hasOnlyKeys($packet, ['type', 'nickname', 'roomCode', 'identityToken'])
+                    || (array_key_exists('identityToken', $packet) && !is_string($packet['identityToken']))
+                ) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
                 }
                 $this->clients[$connection->id]['last_seen_at'] = time();
@@ -250,6 +254,10 @@ final class ChatRoom
             $this->sendError($connection, 'invalid_room_code', '房间暗号格式无效'); return;
         }
 
+        $identityToken = is_string($packet['identityToken'] ?? null) ? $packet['identityToken'] : null;
+        $identity = $this->identities->resolve($identityToken);
+        unset($identityToken);
+
         $joinResult = $this->rooms->join($roomCode, $connection->id);
         unset($roomCode);
         if ($joinResult['status'] === RoomManager::ROOM_LIMIT_REACHED) {
@@ -260,10 +268,23 @@ final class ChatRoom
         }
 
         $roomKey = $joinResult['roomKey'];
+        $senderId = $this->identities->senderId($identity['subject'], $roomKey);
         $this->clients[$connection->id]['nickname'] = $nickname;
         $this->clients[$connection->id]['room_key'] = $roomKey;
+        $this->clients[$connection->id]['sender_id'] = $senderId;
         $joinedAt = gmdate('c');
-        $this->sendJson($connection, ['type' => 'join', 'nickname' => $nickname, 'roomId' => $joinResult['roomId'], 'self' => true, 'joinedAt' => $joinedAt]);
+        $this->sendJson($connection, [
+            'type' => 'join',
+            'nickname' => $nickname,
+            'roomId' => $joinResult['roomId'],
+            'self' => true,
+            'joinedAt' => $joinedAt,
+            'senderId' => $senderId,
+            'identityToken' => $identity['token'],
+            'identityExpiresAt' => $identity['expiresAt'],
+            'identityRestored' => $identity['restored'],
+        ]);
+        unset($identity);
         $this->sendJson($connection, ['type' => 'history', 'messages' => $this->rooms->history($roomKey)]);
         $this->broadcastToRoom($roomKey, ['type' => 'join', 'nickname' => $nickname, 'self' => false, 'joinedAt' => $joinedAt], $connection->id);
         $this->broadcastPresence($roomKey, 'join', $nickname);
@@ -273,7 +294,7 @@ final class ChatRoom
     private function handleChat(TcpConnection $connection, array $packet): void
     {
         $client = $this->clients[$connection->id];
-        if ($client['nickname'] === null || $client['room_key'] === null) {
+        if ($client['nickname'] === null || $client['room_key'] === null || $client['sender_id'] === null) {
             $this->sendError($connection, 'join_required', '请先加入房间'); return;
         }
         if (!$this->allowConnectionChat($connection->id) || $client['rate_key'] === null || !$this->ipLimiter->allowChat($client['rate_key'])) {
@@ -293,7 +314,7 @@ final class ChatRoom
         if ($this->unicodeLength($text) > $this->maxMessageCharacters) {
             $this->sendError($connection, 'message_too_long', '消息过长'); return;
         }
-        $message = $this->rooms->addMessage($client['room_key'], $client['nickname'], $text);
+        $message = $this->rooms->addMessage($client['room_key'], $client['nickname'], $text, $client['sender_id']);
         $this->broadcastToRoom($client['room_key'], array_merge(['type' => 'chat'], $message));
     }
 
