@@ -97,15 +97,31 @@
           <p class="room-subtitle">
             <span id="currentNickname">未加入</span>
             <span aria-hidden="true">·</span>
-            <span><strong id="onlineCount">0</strong> 人在线</span>
+            <span><strong id="onlineCount">0</strong> 个连接在线</span>
           </p>
         </div>
 
         <div class="room-actions">
+          <button id="membersButton" class="secondary-button" type="button" aria-controls="membersPanel" aria-expanded="false">在线成员</button>
           <button id="reconnectButton" class="secondary-button" type="button" hidden>重新连接</button>
           <button id="leaveButton" class="leave-button" type="button">退出房间</button>
         </div>
       </header>
+
+      <div id="membersBackdrop" class="members-backdrop" hidden>
+        <aside id="membersPanel" class="members-panel" aria-labelledby="membersTitle" tabindex="-1">
+          <div class="members-panel__header">
+            <div>
+              <p class="eyebrow">LIVE CONNECTIONS</p>
+              <h2 id="membersTitle">在线成员</h2>
+              <p id="membersSummary">当前没有在线连接</p>
+            </div>
+            <button id="membersCloseButton" class="icon-button" type="button" aria-label="关闭在线成员面板">×</button>
+          </div>
+          <ol id="membersList" class="members-list" aria-live="polite"></ol>
+          <p class="members-note">每一项代表一个连接；同一人使用多个标签页或设备时会分别显示。</p>
+        </aside>
+      </div>
 
       <div class="message-stage">
         <ol id="messages" class="messages" tabindex="0" aria-live="polite" aria-relevant="additions" aria-label="最近 24 小时的聊天消息">
@@ -125,8 +141,17 @@
         </button>
       </div>
 
+      <div id="typingIndicator" class="typing-indicator" role="status" aria-live="polite" aria-atomic="true"></div>
+
       <form id="messageForm" class="composer" autocomplete="off">
         <div class="composer-field">
+          <div id="replyPreview" class="reply-preview" hidden>
+            <div>
+              <span>回复 <strong id="replyPreviewNickname"></strong></span>
+              <p id="replyPreviewText"></p>
+            </div>
+            <button id="cancelReplyButton" class="icon-button" type="button" aria-label="取消引用回复">×</button>
+          </div>
           <label class="sr-only" for="messageInput">消息</label>
           <textarea id="messageInput" rows="1" maxlength="2000" placeholder="写点什么…" disabled enterkeyhint="send" aria-describedby="composerFeedback messageCount"></textarea>
           <div class="composer-meta">

@@ -12,10 +12,12 @@ use Workerman\Worker;
 
 final class ChatRoom
 {
-    /** @var array<int, array{connection: TcpConnection, nickname: ?string, room_key: ?string, sender_id: ?string, connected_at: int, last_seen_at: int, join_attempts: int, handshake_authorized: bool, rate_key: ?string, rate_acquired: bool, chat_times: list<int>, rate_violations: int}> */
+    /** @var array<int, array{connection: TcpConnection, nickname: ?string, room_key: ?string, sender_id: ?string, member_id: string, connected_at: int, joined_at: ?int, last_seen_at: int, join_attempts: int, handshake_authorized: bool, rate_key: ?string, rate_acquired: bool, chat_times: list<int>, typing_times: list<float>, typing_active: bool, typing_expires_at: int, rate_violations: int}> */
     private array $clients = [];
     private readonly RoomManager $rooms;
     private bool $shuttingDown = false;
+    private int $membersVersion = 0;
+    private int $typingSequence = 0;
 
     public function __construct(
         private readonly int $maxFrameBytes,
@@ -34,6 +36,9 @@ final class ChatRoom
         private readonly int $maxSendBufferBytes,
         private readonly int $connectionChatLimit,
         private readonly int $connectionChatWindow,
+        private readonly int $typingTtlSeconds,
+        private readonly int $connectionTypingLimit,
+        private readonly int $connectionTypingWindow,
         private readonly OriginPolicy $originPolicy,
         private readonly ClientIpResolver $ipResolver,
         private readonly IpRateLimiter $ipLimiter,
@@ -72,9 +77,11 @@ final class ChatRoom
 
         $this->clients[$connection->id] = [
             'connection' => $connection, 'nickname' => null, 'room_key' => null, 'sender_id' => null,
-            'connected_at' => $now, 'last_seen_at' => $now, 'join_attempts' => 0,
+            'member_id' => $this->generateMemberId(), 'connected_at' => $now, 'joined_at' => null,
+            'last_seen_at' => $now, 'join_attempts' => 0,
             'handshake_authorized' => false, 'rate_key' => $rateKey, 'rate_acquired' => $rateAcquired,
-            'chat_times' => [], 'rate_violations' => 0,
+            'chat_times' => [], 'typing_times' => [], 'typing_active' => false, 'typing_expires_at' => 0,
+            'rate_violations' => 0,
         ];
     }
 
@@ -129,8 +136,12 @@ final class ChatRoom
             $this->ipLimiter->releaseConnection($client['rate_key']);
         }
         if ($client['nickname'] !== null && $client['room_key'] !== null) {
+            if ($client['typing_active']) {
+                $this->broadcastTypingState($client['room_key'], $client, false, $connection->id);
+            }
             $this->rooms->leave($client['room_key'], $connection->id);
             $this->broadcastPresence($client['room_key'], 'leave', $client['nickname']);
+            $this->sendMembersSnapshot($client['room_key']);
         }
     }
 
@@ -164,14 +175,20 @@ final class ChatRoom
                 ) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
                 }
-                $this->clients[$connection->id]['last_seen_at'] = time();
                 $this->handleJoin($connection, $packet); return;
             case 'chat':
-                if (!$this->hasOnlyKeys($packet, ['type', 'text'])) {
+                if (
+                    !$this->hasOnlyKeys($packet, ['type', 'text', 'replyToId'])
+                    || (array_key_exists('replyToId', $packet) && !is_string($packet['replyToId']))
+                ) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
                 }
-                $this->clients[$connection->id]['last_seen_at'] = time();
                 $this->handleChat($connection, $packet); return;
+            case 'typing':
+                if (!$this->hasOnlyKeys($packet, ['type', 'active']) || !is_bool($packet['active'] ?? null)) {
+                    $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
+                }
+                $this->handleTyping($connection, $packet['active']); return;
             case 'ping':
                 if (!$this->hasOnlyKeys($packet, ['type', 'ts']) || (isset($packet['ts']) && !is_int($packet['ts']) && !is_float($packet['ts']))) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
@@ -206,6 +223,17 @@ final class ChatRoom
     {
         $this->ipLimiter->prune();
         return $this->rooms->pruneExpired();
+    }
+
+    public function pruneTypingStates(): void
+    {
+        $now = time();
+        foreach (array_keys($this->clients) as $connectionId) {
+            $client = $this->clients[$connectionId] ?? null;
+            if ($client !== null && $client['typing_active'] && $client['typing_expires_at'] <= $now) {
+                $this->clearTyping($connectionId, true);
+            }
+        }
     }
 
     public function handleBufferFull(TcpConnection $connection): void
@@ -269,10 +297,13 @@ final class ChatRoom
 
         $roomKey = $joinResult['roomKey'];
         $senderId = $this->identities->senderId($identity['subject'], $roomKey);
+        $joinedAtUnix = time();
         $this->clients[$connection->id]['nickname'] = $nickname;
         $this->clients[$connection->id]['room_key'] = $roomKey;
         $this->clients[$connection->id]['sender_id'] = $senderId;
-        $joinedAt = gmdate('c');
+        $this->clients[$connection->id]['joined_at'] = $joinedAtUnix;
+        $this->clients[$connection->id]['last_seen_at'] = $joinedAtUnix;
+        $joinedAt = gmdate('c', $joinedAtUnix);
         $this->sendJson($connection, [
             'type' => 'join',
             'nickname' => $nickname,
@@ -280,6 +311,7 @@ final class ChatRoom
             'self' => true,
             'joinedAt' => $joinedAt,
             'senderId' => $senderId,
+            'memberId' => $this->clients[$connection->id]['member_id'],
             'identityToken' => $identity['token'],
             'identityExpiresAt' => $identity['expiresAt'],
             'identityRestored' => $identity['restored'],
@@ -288,6 +320,7 @@ final class ChatRoom
         $this->sendJson($connection, ['type' => 'history', 'messages' => $this->rooms->history($roomKey)]);
         $this->broadcastToRoom($roomKey, ['type' => 'join', 'nickname' => $nickname, 'self' => false, 'joinedAt' => $joinedAt], $connection->id);
         $this->broadcastPresence($roomKey, 'join', $nickname);
+        $this->sendMembersSnapshot($roomKey);
     }
 
     /** @param array<string, mixed> $packet */
@@ -314,8 +347,57 @@ final class ChatRoom
         if ($this->unicodeLength($text) > $this->maxMessageCharacters) {
             $this->sendError($connection, 'message_too_long', '消息过长'); return;
         }
-        $message = $this->rooms->addMessage($client['room_key'], $client['nickname'], $text, $client['sender_id']);
+
+        $replyToId = null;
+        if (array_key_exists('replyToId', $packet)) {
+            $replyToId = $packet['replyToId'];
+            if (preg_match('/\A[a-f0-9]{32}\z/D', $replyToId) !== 1) {
+                $this->sendError($connection, 'invalid_reply_target', '引用消息标识无效'); return;
+            }
+            if ($this->rooms->message($client['room_key'], $replyToId) === null) {
+                $this->sendError($connection, 'reply_target_unavailable', '原消息已过期或不在最近记录中'); return;
+            }
+        }
+
+        $this->clients[$connection->id]['last_seen_at'] = time();
+        $this->clearTyping($connection->id, true);
+        $message = $this->rooms->addMessage(
+            $client['room_key'],
+            $client['nickname'],
+            $text,
+            $client['sender_id'],
+            $replyToId,
+        );
         $this->broadcastToRoom($client['room_key'], array_merge(['type' => 'chat'], $message));
+    }
+
+    private function handleTyping(TcpConnection $connection, bool $active): void
+    {
+        $client = $this->clients[$connection->id];
+        if ($client['nickname'] === null || $client['room_key'] === null || $client['sender_id'] === null) {
+            $this->sendError($connection, 'join_required', '请先加入房间'); return;
+        }
+        if (!$this->allowConnectionTyping($connection->id)) {
+            $this->sendError($connection, 'typing_rate_limited', '输入状态更新过于频繁'); return;
+        }
+        $this->clients[$connection->id]['last_seen_at'] = time();
+
+        if (!$active) {
+            $this->clearTyping($connection->id, true);
+            return;
+        }
+
+        $wasActive = $this->clients[$connection->id]['typing_active'];
+        $this->clients[$connection->id]['typing_active'] = true;
+        $this->clients[$connection->id]['typing_expires_at'] = time() + $this->typingTtlSeconds;
+        if (!$wasActive) {
+            $this->broadcastTypingState(
+                $client['room_key'],
+                $this->clients[$connection->id],
+                true,
+                $connection->id,
+            );
+        }
     }
 
     private function allowConnectionChat(int $connectionId): bool
@@ -328,6 +410,98 @@ final class ChatRoom
         $times[] = $now;
         $this->clients[$connectionId]['chat_times'] = $times;
         return true;
+    }
+
+    private function allowConnectionTyping(int $connectionId): bool
+    {
+        $now = microtime(true);
+        $times = array_values(array_filter(
+            $this->clients[$connectionId]['typing_times'],
+            fn (float $timestamp): bool => $timestamp > $now - $this->connectionTypingWindow,
+        ));
+        if (count($times) >= $this->connectionTypingLimit) {
+            $this->clients[$connectionId]['typing_times'] = $times;
+            return false;
+        }
+
+        $times[] = $now;
+        $this->clients[$connectionId]['typing_times'] = $times;
+        return true;
+    }
+
+    private function clearTyping(int $connectionId, bool $broadcast): void
+    {
+        $client = $this->clients[$connectionId] ?? null;
+        if ($client === null || !$client['typing_active']) {
+            return;
+        }
+
+        $this->clients[$connectionId]['typing_active'] = false;
+        $this->clients[$connectionId]['typing_expires_at'] = 0;
+        if ($broadcast && $client['room_key'] !== null && $client['nickname'] !== null && $client['sender_id'] !== null) {
+            $this->broadcastTypingState($client['room_key'], $client, false, $connectionId);
+        }
+    }
+
+    /** @param array<string, mixed> $client */
+    private function broadcastTypingState(string $roomKey, array $client, bool $active, int $excludeConnectionId): void
+    {
+        $packet = [
+            'type' => 'typing',
+            'active' => $active,
+            'memberId' => $client['member_id'],
+            'nickname' => $client['nickname'],
+            'senderId' => $client['sender_id'],
+            'sequence' => ++$this->typingSequence,
+        ];
+        if ($active) {
+            $packet['expiresAt'] = gmdate('c', $client['typing_expires_at']);
+        }
+
+        $this->broadcastToRoom($roomKey, $packet, $excludeConnectionId);
+    }
+
+    private function sendMembersSnapshot(string $roomKey): void
+    {
+        $members = [];
+        foreach ($this->clients as $client) {
+            if (
+                $client['room_key'] !== $roomKey
+                || $client['nickname'] === null
+                || $client['sender_id'] === null
+                || $client['joined_at'] === null
+            ) {
+                continue;
+            }
+            $members[] = [
+                'memberId' => $client['member_id'],
+                'nickname' => $client['nickname'],
+                'senderId' => $client['sender_id'],
+                'joinedAt' => gmdate('c', $client['joined_at']),
+                'lastSeenAt' => gmdate('c', $client['last_seen_at']),
+            ];
+        }
+
+        usort($members, static fn (array $left, array $right): int =>
+            [$left['joinedAt'], $left['memberId']] <=> [$right['joinedAt'], $right['memberId']]
+        );
+        $version = ++$this->membersVersion;
+        $generatedAt = gmdate('c');
+        $count = count($members);
+
+        foreach ($this->clients as $client) {
+            if ($client['room_key'] !== $roomKey || $client['nickname'] === null) {
+                continue;
+            }
+            $this->sendJson($client['connection'], [
+                'type' => 'members',
+                'version' => $version,
+                'generatedAt' => $generatedAt,
+                'count' => $count,
+                'selfMemberId' => $client['member_id'],
+                'members' => $members,
+            ]);
+        }
     }
 
     private function broadcastPresence(string $roomKey, string $event, string $nickname): void
@@ -442,5 +616,14 @@ final class ChatRoom
         $result = preg_match_all('/./us', $value, $matches);
         unset($matches);
         return $result === false ? PHP_INT_MAX : $result;
+    }
+
+    private function generateMemberId(): string
+    {
+        do {
+            $memberId = bin2hex(random_bytes(16));
+        } while (in_array($memberId, array_column($this->clients, 'member_id'), true));
+
+        return $memberId;
     }
 }

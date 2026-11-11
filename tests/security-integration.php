@@ -147,11 +147,11 @@ function securityCheck(bool $condition, string $message): void
     if (!$condition) throw new RuntimeException($message);
 }
 
-/** @return array{0: array<string, mixed>, 1: array<string, mixed>, 2: array<string, mixed>} */
+/** @return array{0: array<string, mixed>, 1: array<string, mixed>, 2: array<string, mixed>, 3: array<string, mixed>} */
 function securityJoin(SecuritySocket $client, string $nickname, string $room = 'SecurityRoom_01'): array
 {
     $client->send(['type' => 'join', 'nickname' => $nickname, 'roomCode' => $room]);
-    return [$client->expect('join'), $client->expect('history'), $client->expect('presence')];
+    return [$client->expect('join'), $client->expect('history'), $client->expect('presence'), $client->expect('members')];
 }
 
 $mode = $argv[1] ?? 'protocol';
@@ -189,20 +189,25 @@ if ($mode === 'lifecycle') {
     securityCheck($silent->status === 101 && $keeper->status === 101, 'Lifecycle clients failed to connect.');
     securityJoin($silent, 'Silent');
     securityJoin($keeper, 'Keeper');
-    $silent->expect('join'); $silent->expect('presence');
+    $silent->expect('join'); $silent->expect('presence'); $silent->expect('members');
     $sawLeave = false;
+    $sawMembers = false;
     $deadline = microtime(true) + 5;
-    while (microtime(true) < $deadline && !$sawLeave) {
+    while (microtime(true) < $deadline && (!$sawLeave || !$sawMembers)) {
         $keeper->send(['type' => 'ping', 'ts' => 1]);
         $packet = $keeper->receive(0.6);
         if (($packet['type'] ?? null) === 'presence' && ($packet['event'] ?? null) === 'leave' && ($packet['count'] ?? null) === 1) {
             $sawLeave = true;
         }
+        if (($packet['type'] ?? null) === 'members' && ($packet['count'] ?? null) === 1) {
+            $sawMembers = true;
+        }
         usleep(250_000);
     }
     securityCheck($sawLeave, 'Heartbeat timeout did not release the silent room member.');
+    securityCheck($sawMembers, 'Heartbeat timeout did not publish a corrected members snapshot.');
     $keeper->close(); $silent->close();
-    echo "PASS: heartbeat timeout releases membership and broadcasts the corrected online count.\n";
+    echo "PASS: heartbeat timeout releases membership and broadcasts corrected presence and members.\n";
     exit(0);
 }
 

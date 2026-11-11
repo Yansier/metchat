@@ -23,6 +23,17 @@
   const latestButton = document.querySelector("#latestButton");
   const latestButtonLabel = document.querySelector("#latestButtonLabel");
   const onlineCount = document.querySelector("#onlineCount");
+  const membersButton = document.querySelector("#membersButton");
+  const membersBackdrop = document.querySelector("#membersBackdrop");
+  const membersPanel = document.querySelector("#membersPanel");
+  const membersCloseButton = document.querySelector("#membersCloseButton");
+  const membersSummary = document.querySelector("#membersSummary");
+  const membersList = document.querySelector("#membersList");
+  const typingIndicator = document.querySelector("#typingIndicator");
+  const replyPreview = document.querySelector("#replyPreview");
+  const replyPreviewNickname = document.querySelector("#replyPreviewNickname");
+  const replyPreviewText = document.querySelector("#replyPreviewText");
+  const cancelReplyButton = document.querySelector("#cancelReplyButton");
   const currentNickname = document.querySelector("#currentNickname");
   const roomStatus = document.querySelector("#roomStatus");
   const composerFeedback = document.querySelector("#composerFeedback");
@@ -36,9 +47,14 @@
   const RECONNECT_BASE_DELAY_MS = 1_000;
   const BOTTOM_THRESHOLD_PX = 96;
   const MAX_MESSAGE_CHARACTERS = 2_000;
+  const MAX_RENDERED_MESSAGES = 50;
   const ROOM_CODE_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
   const IDENTITY_TOKEN_STORAGE_KEY = "metchat.anonymousIdentityToken";
   const MAX_IDENTITY_TOKEN_BYTES = 512;
+  const TYPING_IDLE_DELAY_MS = 2_000;
+  const TYPING_REFRESH_INTERVAL_MS = 3_000;
+  const REMOTE_TYPING_FALLBACK_MS = 5_500;
+  const REPLY_EXCERPT_CHARACTERS = 72;
   const DEFAULT_COMPOSER_HINT = "Enter 发送 · Shift + Enter 换行";
 
   const JOIN_ERROR_MESSAGES = {
@@ -49,6 +65,9 @@
     too_many_join_attempts: "加入尝试过于频繁，请稍后重新连接。",
     invalid_nickname: "请输入有效昵称。",
     nickname_too_long: "昵称不能超过 24 个字符。",
+    invalid_reply_target: "引用消息标识无效，请重新选择回复对象。",
+    reply_target_unavailable: "原消息已过期或不在最近记录中。",
+    typing_rate_limited: "输入状态更新过于频繁，聊天消息仍可正常发送。",
   };
 
   let socket = null;
@@ -57,6 +76,9 @@
   let roomId = "";
   let identityToken = readIdentityToken();
   let currentSenderId = "";
+  let currentMemberId = "";
+  let membersVersion = -1;
+  let currentMembers = [];
   let joined = false;
   let heartbeatTimer = null;
   let reconnectTimer = null;
@@ -69,9 +91,18 @@
   let unseenMessageCount = 0;
   let viewportFrame = null;
   let rootStyleRule = null;
+  let replyTargetId = "";
+  let localTypingActive = false;
+  let typingIdleTimer = null;
+  let typingRefreshTimer = null;
+  let isComposing = false;
 
   // IDs exist only for this page lifetime and are never persisted.
   const seenMessageIds = new Set();
+  const messagePackets = new Map();
+  const messageElements = new Map();
+  const remoteTyping = new Map();
+  const typingSequences = new Map();
 
   function readIdentityToken() {
     try {
@@ -145,6 +176,274 @@
     }).format(date);
   }
 
+  function excerpt(value, maximum = REPLY_EXCERPT_CHARACTERS) {
+    const normalized = String(value ?? "").replace(/\s+/gu, " ").trim();
+    const characters = Array.from(normalized);
+    return characters.length > maximum ? `${characters.slice(0, maximum).join("")}…` : normalized;
+  }
+
+  function renderMembers() {
+    membersList.replaceChildren();
+    membersSummary.textContent = currentMembers.length > 0
+      ? `${currentMembers.length} 个在线连接`
+      : "当前没有在线连接";
+    membersButton.textContent = currentMembers.length > 0
+      ? `在线成员 ${currentMembers.length}`
+      : "在线成员";
+
+    for (const member of currentMembers) {
+      const item = document.createElement("li");
+      item.className = "member-card";
+
+      const name = document.createElement("span");
+      name.className = "member-card__name";
+      name.textContent = member.nickname;
+      item.append(name);
+
+      if (member.memberId === currentMemberId) {
+        const self = document.createElement("span");
+        self.className = "member-card__self";
+        self.textContent = "当前连接";
+        item.append(self);
+      }
+
+      const meta = document.createElement("span");
+      meta.className = "member-card__meta";
+      meta.textContent = `连接 ${member.memberId.slice(0, 8)} · 加入 ${formatTime(member.joinedAt)}`;
+      item.append(meta);
+      membersList.append(item);
+    }
+  }
+
+  function closeMembersPanel() {
+    membersBackdrop.hidden = true;
+    membersButton.setAttribute("aria-expanded", "false");
+  }
+
+  function resetMembers() {
+    membersVersion = -1;
+    currentMemberId = "";
+    currentMembers = [];
+    membersButton.disabled = true;
+    onlineCount.textContent = "0";
+    renderMembers();
+    closeMembersPanel();
+  }
+
+  function clearRemoteTyping() {
+    for (const state of remoteTyping.values()) {
+      window.clearTimeout(state.timer);
+    }
+    remoteTyping.clear();
+    typingSequences.clear();
+    typingIndicator.textContent = "";
+  }
+
+  function renderTypingIndicator() {
+    const activeStates = [...remoteTyping.values()];
+    if (activeStates.length === 0) {
+      typingIndicator.textContent = "";
+    } else if (activeStates.length <= 2) {
+      typingIndicator.textContent = `${activeStates.map((state) => state.nickname).join("、")} 正在输入…`;
+    } else {
+      typingIndicator.textContent = `${activeStates.length} 个连接正在输入…`;
+    }
+  }
+
+  function applyMembers(packet) {
+    if (!Number.isInteger(packet.version) || packet.version <= membersVersion || !Array.isArray(packet.members)) {
+      return;
+    }
+
+    const seenMemberIds = new Set();
+    const membersSnapshot = [];
+    for (const member of packet.members.slice(0, 64)) {
+      if (
+        !member
+        || typeof member.memberId !== "string"
+        || !/^[a-f0-9]{32}$/.test(member.memberId)
+        || seenMemberIds.has(member.memberId)
+        || typeof member.nickname !== "string"
+        || typeof member.senderId !== "string"
+        || typeof member.joinedAt !== "string"
+        || typeof member.lastSeenAt !== "string"
+      ) {
+        return;
+      }
+      seenMemberIds.add(member.memberId);
+      membersSnapshot.push(member);
+    }
+    if (
+      packet.count !== membersSnapshot.length
+      || typeof packet.selfMemberId !== "string"
+      || !seenMemberIds.has(packet.selfMemberId)
+    ) {
+      return;
+    }
+
+    membersVersion = packet.version;
+    currentMemberId = packet.selfMemberId;
+    currentMembers = membersSnapshot;
+    membersButton.disabled = false;
+    onlineCount.textContent = String(membersSnapshot.length);
+    renderMembers();
+
+    for (const [memberId, state] of remoteTyping) {
+      if (!seenMemberIds.has(memberId)) {
+        window.clearTimeout(state.timer);
+        remoteTyping.delete(memberId);
+        typingSequences.delete(memberId);
+      }
+    }
+    for (const memberId of typingSequences.keys()) {
+      if (!seenMemberIds.has(memberId)) {
+        typingSequences.delete(memberId);
+      }
+    }
+    renderTypingIndicator();
+  }
+
+  function handleTypingPacket(packet) {
+    if (
+      typeof packet.memberId !== "string"
+      || typeof packet.nickname !== "string"
+      || typeof packet.senderId !== "string"
+      || typeof packet.active !== "boolean"
+      || !Number.isInteger(packet.sequence)
+      || packet.memberId === currentMemberId
+    ) {
+      return;
+    }
+
+    const previousSequence = typingSequences.get(packet.memberId) ?? -1;
+    if (packet.sequence <= previousSequence) {
+      return;
+    }
+    typingSequences.set(packet.memberId, packet.sequence);
+    const previous = remoteTyping.get(packet.memberId);
+    if (previous) {
+      window.clearTimeout(previous.timer);
+      remoteTyping.delete(packet.memberId);
+    }
+    if (!packet.active) {
+      renderTypingIndicator();
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      const current = remoteTyping.get(packet.memberId);
+      if (current?.sequence === packet.sequence) {
+        remoteTyping.delete(packet.memberId);
+        renderTypingIndicator();
+      }
+    }, REMOTE_TYPING_FALLBACK_MS);
+    remoteTyping.set(packet.memberId, { nickname: packet.nickname, sequence: packet.sequence, timer });
+    renderTypingIndicator();
+  }
+
+  function stopLocalTyping(notifyServer = true) {
+    if (typingIdleTimer !== null) {
+      window.clearTimeout(typingIdleTimer);
+      typingIdleTimer = null;
+    }
+    if (typingRefreshTimer !== null) {
+      window.clearInterval(typingRefreshTimer);
+      typingRefreshTimer = null;
+    }
+    if (localTypingActive && notifyServer) {
+      send({ type: "typing", active: false });
+    }
+    localTypingActive = false;
+  }
+
+  function noteLocalTyping() {
+    if (!joined || !messageInput.value || !socket || socket.readyState !== WebSocket.OPEN) {
+      stopLocalTyping(true);
+      return;
+    }
+    if (!localTypingActive) {
+      if (!send({ type: "typing", active: true })) {
+        return;
+      }
+      localTypingActive = true;
+      typingRefreshTimer = window.setInterval(() => {
+        if (localTypingActive) {
+          send({ type: "typing", active: true });
+        }
+      }, TYPING_REFRESH_INTERVAL_MS);
+    }
+    if (typingIdleTimer !== null) {
+      window.clearTimeout(typingIdleTimer);
+    }
+    typingIdleTimer = window.setTimeout(() => stopLocalTyping(true), TYPING_IDLE_DELAY_MS);
+  }
+
+  function clearReply() {
+    replyTargetId = "";
+    replyPreview.hidden = true;
+    replyPreviewNickname.textContent = "";
+    replyPreviewText.textContent = "";
+  }
+
+  function beginReply(messageId) {
+    const target = messagePackets.get(messageId);
+    if (!target) {
+      setComposerFeedback("原消息已过期或不在最近记录中。", "error");
+      return;
+    }
+    replyTargetId = messageId;
+    replyPreviewNickname.textContent = target.nickname;
+    replyPreviewText.textContent = excerpt(target.text);
+    replyPreview.hidden = false;
+    messageInput.focus({ preventScroll: true });
+  }
+
+  function focusReferencedMessage(messageId) {
+    const target = messageElements.get(messageId);
+    if (!target) {
+      setComposerFeedback("原消息已过期或不在最近记录中。", "error");
+      return;
+    }
+    target.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.classList.add("message--highlight");
+    window.setTimeout(() => target.classList.remove("message--highlight"), 1_600);
+  }
+
+  function populateReplyContext(replyContext, replyToId) {
+    const referenced = messagePackets.get(replyToId);
+    const referencedName = document.createElement("strong");
+    const referencedText = document.createElement("span");
+    if (referenced) {
+      referencedName.textContent = `回复 ${referenced.nickname}`;
+      referencedText.textContent = excerpt(referenced.text);
+    } else {
+      referencedName.textContent = "引用消息";
+      referencedText.textContent = "原消息已过期或不在最近记录中。";
+    }
+    replyContext.replaceChildren(referencedName, referencedText);
+  }
+
+  function enforceRenderedMessageLimit() {
+    const renderedMessages = [...messages.querySelectorAll(".message")];
+    for (const item of renderedMessages.slice(0, -MAX_RENDERED_MESSAGES)) {
+      const removedId = item.dataset.messageId;
+      item.remove();
+      if (removedId) {
+        seenMessageIds.delete(removedId);
+        messagePackets.delete(removedId);
+        messageElements.delete(removedId);
+        if (replyTargetId === removedId) {
+          clearReply();
+          setComposerFeedback("引用目标已超出最近 50 条消息。", "error");
+        }
+      }
+    }
+
+    for (const replyContext of messages.querySelectorAll(".message__reply-context")) {
+      populateReplyContext(replyContext, replyContext.dataset.replyToId || "");
+    }
+  }
+
   function isNearBottom() {
     return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= BOTTOM_THRESHOLD_PX;
   }
@@ -180,7 +479,11 @@
       && packet.id.length > 0
       && typeof packet.nickname === "string"
       && typeof packet.text === "string"
-      && typeof packet.sentAt === "string";
+      && typeof packet.sentAt === "string"
+      && (
+        !Object.prototype.hasOwnProperty.call(packet, "replyToId")
+        || (typeof packet.replyToId === "string" && /^[a-f0-9]{32}$/.test(packet.replyToId))
+      );
   }
 
   function messageOwnership(packet) {
@@ -200,6 +503,8 @@
     const item = document.createElement("li");
     item.className = `message message--${messageOwnership(packet)}`;
     item.dataset.messageId = packet.id;
+    messagePackets.set(packet.id, packet);
+    messageElements.set(packet.id, item);
 
     const meta = document.createElement("p");
     meta.className = "message__meta";
@@ -213,9 +518,31 @@
     body.className = "message__body";
     body.textContent = packet.text;
 
-    item.append(meta, body);
+    item.append(meta);
+    if (typeof packet.replyToId === "string") {
+      const replyContext = document.createElement("button");
+      replyContext.className = "message__reply-context";
+      replyContext.type = "button";
+      replyContext.dataset.replyToId = packet.replyToId;
+      populateReplyContext(replyContext, packet.replyToId);
+      replyContext.addEventListener("click", () => focusReferencedMessage(packet.replyToId));
+      item.append(replyContext);
+    }
+    item.append(body);
+
+    const actions = document.createElement("div");
+    actions.className = "message__actions";
+    const replyButton = document.createElement("button");
+    replyButton.className = "message__reply-action";
+    replyButton.type = "button";
+    replyButton.textContent = "回复";
+    replyButton.setAttribute("aria-label", `回复 ${packet.nickname} 的消息`);
+    replyButton.addEventListener("click", () => beginReply(packet.id));
+    actions.append(replyButton);
+    item.append(actions);
     messages.append(item);
     seenMessageIds.add(packet.id);
+    enforceRenderedMessageLimit();
     updateEmptyState();
 
     if (autoScroll && shouldScroll) {
@@ -337,6 +664,9 @@
     socket = null;
     joined = false;
     stopHeartbeat();
+    stopLocalTyping(false);
+    clearRemoteTyping();
+    resetMembers();
     setComposerEnabled(false);
     if (roomId) {
       roomStatus.textContent = `ID ${roomId} · 已断开`;
@@ -378,6 +708,7 @@
       case "join":
         if (packet.self === true) {
           currentSenderId = typeof packet.senderId === "string" ? packet.senderId : "";
+          currentMemberId = typeof packet.memberId === "string" ? packet.memberId : "";
           if (
             typeof packet.identityToken === "string"
             && packet.identityToken.length > 0
@@ -418,6 +749,16 @@
       case "chat":
         appendChat(packet);
         setComposerFeedback();
+        break;
+      case "members":
+        if (joined) {
+          applyMembers(packet);
+        }
+        break;
+      case "typing":
+        if (joined) {
+          handleTypingPacket(packet);
+        }
         break;
       case "presence":
         if (Number.isInteger(packet.count) && packet.count >= 0) {
@@ -506,6 +847,9 @@
   function clearRoomMessages() {
     messages.querySelectorAll(".message, .system-message").forEach((item) => item.remove());
     seenMessageIds.clear();
+    messagePackets.clear();
+    messageElements.clear();
+    clearReply();
     hasLoadedHistory = false;
     historyLoading.hidden = false;
     emptyState.hidden = true;
@@ -517,6 +861,8 @@
     suppressReconnect = true;
     clearReconnectTimer();
     stopHeartbeat();
+    stopLocalTyping(true);
+    clearRemoteTyping();
 
     const closingSocket = socket;
     socket = null;
@@ -528,6 +874,7 @@
     roomCode = "";
     roomId = "";
     currentSenderId = "";
+    resetMembers();
     clearIdentityToken();
     reconnectAttempts = 0;
     focusAfterHistory = false;
@@ -713,12 +1060,19 @@
       return;
     }
 
+    const chatPacket = { type: "chat", text };
+    if (replyTargetId) {
+      chatPacket.replyToId = replyTargetId;
+    }
+
+    stopLocalTyping(true);
     // Render only the server echo with its authoritative ID and timestamp.
-    if (!send({ type: "chat", text })) {
+    if (!send(chatPacket)) {
       setComposerFeedback("发送失败，消息仍保留在输入框中。", "error");
       return;
     }
 
+    clearReply();
     messageInput.value = "";
     messageInput.rows = 1;
     updateMessageCount();
@@ -728,7 +1082,7 @@
   });
 
   messageInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !isComposing) {
       event.preventDefault();
       messageForm.requestSubmit();
     }
@@ -737,8 +1091,46 @@
   messageInput.addEventListener("input", () => {
     resizeMessageInput();
     updateMessageCount();
+    noteLocalTyping();
     if (composerFeedback.dataset.tone === "error") {
       setComposerFeedback();
+    }
+  });
+
+  messageInput.addEventListener("compositionstart", () => {
+    isComposing = true;
+    noteLocalTyping();
+  });
+  messageInput.addEventListener("compositionend", () => {
+    isComposing = false;
+    noteLocalTyping();
+  });
+  messageInput.addEventListener("blur", () => stopLocalTyping(true));
+
+  cancelReplyButton.addEventListener("click", () => {
+    clearReply();
+    messageInput.focus({ preventScroll: true });
+  });
+
+  membersButton.addEventListener("click", () => {
+    membersBackdrop.hidden = false;
+    membersButton.setAttribute("aria-expanded", "true");
+    membersPanel.focus({ preventScroll: true });
+  });
+  membersCloseButton.addEventListener("click", () => {
+    closeMembersPanel();
+    membersButton.focus({ preventScroll: true });
+  });
+  membersBackdrop.addEventListener("click", (event) => {
+    if (event.target === membersBackdrop) {
+      closeMembersPanel();
+      membersButton.focus({ preventScroll: true });
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !membersBackdrop.hidden) {
+      closeMembersPanel();
+      membersButton.focus({ preventScroll: true });
     }
   });
 
@@ -769,6 +1161,8 @@
     pageUnloading = true;
     clearReconnectTimer();
     stopHeartbeat();
+    stopLocalTyping(false);
+    clearRemoteTyping();
     const closingSocket = socket;
     socket = null;
     closingSocket?.close(1000);

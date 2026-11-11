@@ -14,7 +14,7 @@ use Closure;
 final class MessageHistory
 {
     /**
-     * @var list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string, expires_at: int}>
+     * @var list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string, expires_at: int}>
      */
     private array $messages = [];
 
@@ -36,8 +36,8 @@ final class MessageHistory
         $this->clock = $clock ?? static fn (): int => time();
     }
 
-    /** @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string} */
-    public function add(string $nickname, string $text, string $senderId): array
+    /** @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string} */
+    public function add(string $nickname, string $text, string $senderId, ?string $replyToId = null): array
     {
         $now = ($this->clock)();
         $message = [
@@ -48,6 +48,9 @@ final class MessageHistory
             'senderId' => $senderId,
             'expires_at' => $now + $this->ttlSeconds,
         ];
+        if ($replyToId !== null) {
+            $message['replyToId'] = $replyToId;
+        }
 
         $this->messages[] = $message;
 
@@ -61,7 +64,7 @@ final class MessageHistory
     /**
      * Expired messages are filtered immediately before every history read.
      *
-     * @return list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string}>
+     * @return list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string}>
      */
     public function all(): array
     {
@@ -90,19 +93,38 @@ final class MessageHistory
         return count($this->messages);
     }
 
+    /** @return null|array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string} */
+    public function find(string $messageId): ?array
+    {
+        $this->pruneExpired();
+
+        foreach ($this->messages as $message) {
+            if ($message['id'] === $messageId) {
+                return $this->toPublicMessage($message);
+            }
+        }
+
+        return null;
+    }
+
     /**
-     * @param array{id: string, nickname: string, text: string, sentAt: string, senderId: string, expires_at: int} $message
-     * @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string}
+     * @param array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string, expires_at: int} $message
+     * @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string}
      */
     private function toPublicMessage(array $message): array
     {
-        return [
+        $publicMessage = [
             'id' => $message['id'],
             'nickname' => $message['nickname'],
             'text' => $message['text'],
             'sentAt' => $message['sentAt'],
             'senderId' => $message['senderId'],
         ];
+        if (isset($message['replyToId'])) {
+            $publicMessage['replyToId'] = $message['replyToId'];
+        }
+
+        return $publicMessage;
     }
 
     private function generateUniqueId(): string

@@ -176,7 +176,7 @@ function check(bool $condition, string $message): void
 }
 
 /**
- * @return array{history: list<array<string, mixed>>, roomId: string, senderId: string, identityToken: string, identityRestored: bool}
+ * @return array{history: list<array<string, mixed>>, roomId: string, senderId: string, memberId: string, identityToken: string, identityRestored: bool, membersVersion: int, members: list<array<string, mixed>>}
  */
 function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?string $identityToken = null): array
 {
@@ -191,19 +191,28 @@ function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?
     check(is_string($join['roomId'] ?? null), "{$nickname} did not receive a safe room identifier.");
     check(!array_key_exists('roomCode', $join), 'Join response exposed a full room code.');
     check(is_string($join['senderId'] ?? null) && $join['senderId'] !== '', "{$nickname} did not receive a sender ID.");
+    check(is_string($join['memberId'] ?? null) && preg_match('/\A[a-f0-9]{32}\z/D', $join['memberId']) === 1, "{$nickname} did not receive a member ID.");
     check(is_string($join['identityToken'] ?? null) && $join['identityToken'] !== '', "{$nickname} did not receive an identity credential.");
     check(is_bool($join['identityRestored'] ?? null), "{$nickname} did not receive identity restoration state.");
     $historyPacket = $client->expect('history');
     $client->expect('presence');
+    $membersPacket = $client->expect('members');
     $history = $historyPacket['messages'] ?? null;
     check(is_array($history), "{$nickname} did not receive a history array.");
+    $members = $membersPacket['members'] ?? null;
+    check(is_array($members), "{$nickname} did not receive a members array.");
+    check(($membersPacket['count'] ?? null) === count($members), 'Members count did not match its snapshot.');
+    check(($membersPacket['selfMemberId'] ?? null) === $join['memberId'], 'Members snapshot did not identify the current connection.');
 
     return [
         'history' => $history,
         'roomId' => $join['roomId'],
         'senderId' => $join['senderId'],
+        'memberId' => $join['memberId'],
         'identityToken' => $join['identityToken'],
         'identityRestored' => $join['identityRestored'],
+        'membersVersion' => $membersPacket['version'],
+        'members' => $members,
     ];
 }
 
@@ -251,11 +260,14 @@ if ($mode === 'seed-restart') {
 if ($mode === 'verify-restart') {
     $clients = [new TestWebSocket(), new TestWebSocket()];
     try {
-        $historyA = joinClient($clients[0], 'VerifyA', $roomA)['history'];
-        $historyB = joinClient($clients[1], 'VerifyB', $roomB)['history'];
+        $joinA = joinClient($clients[0], 'VerifyA', $roomA);
+        $joinB = joinClient($clients[1], 'VerifyB', $roomB);
+        $historyA = $joinA['history'];
+        $historyB = $joinB['history'];
         check(!historyContainsText($historyA, $restartMarkerA), 'Room A history survived restart.');
         check(!historyContainsText($historyB, $restartMarkerB), 'Room B history survived restart.');
-        echo "PASS: Workerman restart cleared all room histories.\n";
+        check(count($joinA['members']) === 1 && count($joinB['members']) === 1, 'Member state survived Workerman restart.');
+        echo "PASS: Workerman restart cleared all room histories and member state.\n";
     } finally {
         closeAll($clients);
     }
@@ -296,6 +308,7 @@ $token = bin2hex(random_bytes(4));
 $aText = "room-a-{$token}";
 $bText = "room-b-{$token}";
 $bAfterExitText = "room-a-after-exit-{$token}";
+$replyText = "room-a-reply-{$token}";
 
 try {
     $alice = $clients[] = new TestWebSocket();
@@ -308,20 +321,84 @@ try {
     $bobBroadcast = $alice->expect('join');
     check(!array_key_exists('identityToken', $bobBroadcast), 'Another client received a private identity credential.');
     $alice->expect('presence');
+    $aliceMembers = $alice->expect('members');
+    check(($aliceMembers['count'] ?? null) === 2 && count($bobJoin['members']) === 2, 'Same-room members snapshot did not contain two connections.');
+    check(
+        count(array_unique(array_column($aliceMembers['members'], 'memberId'))) === 2,
+        'Same-name connections did not receive distinct member IDs.',
+    );
 
     $carol = $clients[] = new TestWebSocket();
     $carolJoin = joinClient($carol, 'Admin', $roomB, $aliceJoin['identityToken']);
     check($carolJoin['roomId'] !== $aliceJoin['roomId'], 'Different room codes returned the same room ID.');
     check($carolJoin['senderId'] !== $aliceJoin['senderId'], 'One identity was linkable across rooms.');
     check($carolJoin['identityRestored'], 'A valid identity credential was not restored in another room.');
+    check(count($carolJoin['members']) === 1, 'Different-room member snapshot exposed another room.');
 
+    $aliceTwin = $clients[] = new TestWebSocket();
+    $aliceTwinJoin = joinClient($aliceTwin, 'Admin', $roomA, $aliceJoin['identityToken']);
+    check($aliceTwinJoin['senderId'] === $aliceJoin['senderId'], 'Same identity did not retain its room sender ID across connections.');
+    check($aliceTwinJoin['memberId'] !== $aliceJoin['memberId'], 'Two connections shared one member ID.');
+    foreach ([$alice, $bob] as $existingMember) {
+        $existingMember->expect('join');
+        $existingMember->expect('presence');
+        $snapshot = $existingMember->expect('members');
+        check(($snapshot['count'] ?? null) === 3, 'New same-room connection was not synchronized to existing members.');
+        $sameIdentityConnections = array_filter(
+            $snapshot['members'],
+            static fn (array $member): bool => ($member['senderId'] ?? null) === $aliceJoin['senderId'],
+        );
+        check(count($sameIdentityConnections) === 2, 'Same sender identity connections were incorrectly merged.');
+    }
+
+    $alice->send(['type' => 'typing', 'active' => true]);
+    $bobTyping = $bob->expect('typing');
+    $twinTyping = $aliceTwin->expect('typing');
+    check(($bobTyping['memberId'] ?? null) === $aliceJoin['memberId'], 'Typing state did not use the authoritative member ID.');
+    check(($twinTyping['nickname'] ?? null) === 'Admin', 'Typing state lost the authoritative nickname.');
+    $carol->assertNoType('typing');
+    $bob->send(['type' => 'typing', 'active' => true]);
+    check(($alice->expect('typing')['active'] ?? null) === true, 'Second member typing state was not broadcast.');
+    check(($aliceTwin->expect('typing')['active'] ?? null) === true, 'Observer did not receive both concurrent typing states.');
+    $bob->send(['type' => 'typing', 'active' => false]);
+    check(($alice->expect('typing')['active'] ?? null) === false, 'Explicit typing stop was not broadcast.');
+    $aliceTwin->expect('typing');
+    $alice->send(['type' => 'typing', 'active' => false]);
+    check(($bob->expect('typing')['active'] ?? null) === false, 'First member typing state did not clear.');
+    $aliceTwin->expect('typing');
+
+    $aliceTwin->close();
+    foreach ([$alice, $bob] as $existingMember) {
+        $existingMember->expect('presence');
+        check(($existingMember->expect('members')['count'] ?? null) === 2, 'Closed member remained in the members snapshot.');
+    }
+
+    $alice->send(['type' => 'typing', 'active' => true]);
+    check(($bob->expect('typing')['active'] ?? null) === true, 'Typing state did not start before chat.');
     $alice->send(['type' => 'chat', 'text' => $aText]);
     $aliceMessage = $alice->expect('chat');
+    check(($bob->expect('typing')['active'] ?? null) === false, 'Sending chat did not clear typing state.');
     $bobMessage = $bob->expect('chat');
     check(($aliceMessage['id'] ?? null) === ($bobMessage['id'] ?? null), 'Room A clients received inconsistent IDs.');
     check(($aliceMessage['senderId'] ?? null) === $aliceJoin['senderId'], 'Sender echo did not use Alice server identity.');
     check(($bobMessage['senderId'] ?? null) === $aliceJoin['senderId'], 'Room peer saw a different sender identity.');
     $carol->assertNoType('chat');
+
+    $bob->send(['type' => 'chat', 'text' => $replyText, 'replyToId' => $aliceMessage['id']]);
+    $aliceReply = $alice->expect('chat');
+    $bobReply = $bob->expect('chat');
+    check(($aliceReply['replyToId'] ?? null) === $aliceMessage['id'], 'Live reply lost its target ID.');
+    check(($bobReply['id'] ?? null) === ($aliceReply['id'] ?? null), 'Reply sender and peer received inconsistent messages.');
+
+    $carol->send(['type' => 'chat', 'text' => 'cross-room-reply', 'replyToId' => $aliceMessage['id']]);
+    check(($carol->expect('error')['code'] ?? null) === 'reply_target_unavailable', 'Cross-room reply target was accepted.');
+    $carol->assertNoType('chat');
+    $bob->send(['type' => 'chat', 'text' => 'missing-reply', 'replyToId' => str_repeat('f', 32)]);
+    check(($bob->expect('error')['code'] ?? null) === 'reply_target_unavailable', 'Missing reply target was accepted.');
+    $alice->assertNoType('chat');
+    $bob->send(['type' => 'chat', 'text' => 'bad-reply', 'replyToId' => 'not-a-message-id']);
+    check(($bob->expect('error')['code'] ?? null) === 'invalid_reply_target', 'Malformed reply target was accepted.');
+    $alice->assertNoType('chat');
 
     $carol->send(['type' => 'chat', 'text' => $bText]);
     check(($carol->expect('chat')['text'] ?? null) === $bText, 'Room B sender echo failed.');
@@ -330,6 +407,7 @@ try {
 
     $alice->close();
     $bob->expect('presence');
+    check(($bob->expect('members')['count'] ?? null) === 1, 'Active exit did not immediately remove the member.');
     $bob->send(['type' => 'chat', 'text' => $bAfterExitText]);
     check(($bob->expect('chat')['text'] ?? null) === $bAfterExitText, 'Remaining room member could not continue chatting.');
 
@@ -339,10 +417,13 @@ try {
     check($aliceReloadedJoin['identityRestored'], 'Refresh/reconnect credential was not restored.');
     check($aliceReloadedJoin['senderId'] === $aliceJoin['senderId'], 'Changing nickname changed the room identity.');
     check(historyContainsText($restoredA, $aText), 'Room A message was not restored.');
+    check(historyContainsText($restoredA, $replyText), 'Room A reply was not restored.');
     check(historyContainsText($restoredA, $bAfterExitText), 'Room A post-exit message was not restored.');
     check(!historyContainsText($restoredA, $bText), 'Room A history exposed Room B content.');
     $restoredAliceMessages = array_values(array_filter($restoredA, static fn (array $message): bool => ($message['text'] ?? null) === $aText));
     check(($restoredAliceMessages[0]['senderId'] ?? null) === $aliceJoin['senderId'], 'Restored history lost Alice message ownership.');
+    $restoredReplies = array_values(array_filter($restoredA, static fn (array $message): bool => ($message['text'] ?? null) === $replyText));
+    check(($restoredReplies[0]['replyToId'] ?? null) === $aliceMessage['id'], 'Restored reply lost its target ID.');
 
     $forged = $clients[] = new TestWebSocket();
     $forgedToken = substr($aliceJoin['identityToken'], 0, -1) . (str_ends_with($aliceJoin['identityToken'], 'A') ? 'B' : 'A');
@@ -385,6 +466,12 @@ try {
     check(($unjoined->expect('error')['code'] ?? null) === 'join_required', 'Unjoined chat was not rejected.');
     $unjoined->send(['type' => 'history']);
     check(($unjoined->expect('error')['code'] ?? null) === 'unsupported_type', 'Client-triggered history request was not rejected.');
+    $unjoined->send(['type' => 'members']);
+    check(($unjoined->expect('error')['code'] ?? null) === 'unsupported_type', 'Client-triggered members request was not rejected.');
+    $unjoined->send(['type' => 'typing', 'active' => true]);
+    check(($unjoined->expect('error')['code'] ?? null) === 'join_required', 'Unjoined typing state was not rejected.');
+    $unjoined->send(['type' => 'typing', 'active' => true, 'memberId' => str_repeat('a', 32)]);
+    check(($unjoined->expect('error')['code'] ?? null) === 'invalid_packet', 'Client-forged typing member ID was accepted.');
 
     // Empty/invalid codes fail, and repeated join attempts are bounded.
     for ($attempt = 1; $attempt <= 5; ++$attempt) {
@@ -393,6 +480,50 @@ try {
     }
     $unjoined->send(['type' => 'join', 'nickname' => 'Invalid', 'roomCode' => 'bad code']);
     check(($unjoined->expect('error')['code'] ?? null) === 'too_many_join_attempts', 'Join attempt limit was not enforced.');
+
+    closeAll($clients);
+    $clients = [];
+    usleep(250_000);
+
+    // Simulate old nicknames x/k2 and a resumed x connection overlapping the old socket.
+    $diagnosticRoom = "Diagnostic_{$token}";
+    $oldX = $clients[] = new TestWebSocket();
+    $oldXJoin = joinClient($oldX, 'x', $diagnosticRoom);
+    $k2 = $clients[] = new TestWebSocket();
+    joinClient($k2, 'k2', $diagnosticRoom);
+    $oldX->expect('join');
+    $oldX->expect('presence');
+    check(($oldX->expect('members')['count'] ?? null) === 2, 'x/k2 diagnostic room did not show two connections.');
+
+    $resumedX = $clients[] = new TestWebSocket();
+    $resumedXJoin = joinClient($resumedX, 'x', $diagnosticRoom, $oldXJoin['identityToken']);
+    check($resumedXJoin['senderId'] === $oldXJoin['senderId'], 'Resumed x identity changed sender ID.');
+    check($resumedXJoin['memberId'] !== $oldXJoin['memberId'], 'Resumed x connection reused the old member ID.');
+    foreach ([$oldX, $k2] as $observer) {
+        $observer->expect('join');
+        $observer->expect('presence');
+        $overlap = $observer->expect('members');
+        check(($overlap['count'] ?? null) === 3, 'Old and resumed x connections were not both visible during overlap.');
+    }
+
+    $oldX->close();
+    foreach ([$k2, $resumedX] as $observer) {
+        $observer->expect('presence');
+        check(($observer->expect('members')['count'] ?? null) === 2, 'Old x connection became a ghost member after close.');
+    }
+    $k2->send(['type' => 'typing', 'active' => true]);
+    check(($resumedX->expect('typing')['active'] ?? null) === true, 'Typing state did not start in the diagnostic room.');
+    sleep(7);
+    check(($resumedX->expect('typing', 2.0)['active'] ?? null) === false, 'Typing state did not expire automatically.');
+    for ($typingAttempt = 1; $typingAttempt <= 13; ++$typingAttempt) {
+        $k2->send(['type' => 'typing', 'active' => true]);
+    }
+    check(($resumedX->expect('typing')['active'] ?? null) === true, 'Rate test did not broadcast the initial typing state.');
+    check(($k2->expect('error')['code'] ?? null) === 'typing_rate_limited', 'High-frequency typing updates were not limited.');
+    $k2->close();
+    $resumedX->expect('presence');
+    $afterK2 = $resumedX->expect('members');
+    check(($afterK2['count'] ?? null) === 1 && ($afterK2['members'][0]['nickname'] ?? null) === 'x', 'k2 remained after its connection closed.');
 
     closeAll($clients);
     $clients = [];
@@ -426,7 +557,7 @@ try {
     }
     check($capacityRejected, 'Total connection limit was not enforced at the handshake boundary.');
 
-    echo "PASS: room/history isolation, anonymous identity restore, same-name separation, room-scoped sender IDs, forgery rejection, independent caps, offline recovery, authorization checks, join throttling, and capacities.\n";
+    echo "PASS: room/history isolation, authoritative member snapshots, overlap cleanup, typing isolation, ID-only replies, anonymous identity, caps, authorization, throttling, and capacities.\n";
 } finally {
     closeAll($clients);
 }

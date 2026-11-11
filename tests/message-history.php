@@ -46,5 +46,27 @@ checkHistory($messages[0]['text'] === 'message-06', 'The oldest overflow message
 checkHistory($messages[49]['text'] === 'message-55', 'The newest message was not retained.');
 checkHistory(count(array_unique($ids)) === 50, 'Generated message IDs are not unique.');
 
-echo "PASS: server time, 10-minute retention, 24-hour expiry, 50-message cap, ordering, and unique IDs.\n";
+$replyNow = 1_900_000_000;
+$replies = new MessageHistory(50, 100, static function () use (&$replyNow): int {
+    return $replyNow;
+});
+$replyTarget = $replies->add('Alice', 'reply-target', 'sender-a');
+$replyNow += 50;
+$reply = $replies->add('Bob', 'reply-body', 'sender-b', $replyTarget['id']);
+checkHistory($reply['replyToId'] === $replyTarget['id'], 'Reply target ID was not retained.');
+checkHistory($replies->find($replyTarget['id'])['text'] === 'reply-target', 'Valid reply target was not found.');
+$replyNow += 51;
+$remaining = $replies->all();
+checkHistory(count($remaining) === 1 && $remaining[0]['id'] === $reply['id'], 'Reply did not outlive its older target independently.');
+checkHistory($remaining[0]['replyToId'] === $replyTarget['id'], 'Expired target ID was removed from the valid reply.');
+checkHistory($replies->find($replyTarget['id']) === null, 'Expired reply target remained readable.');
+
+$evicted = new MessageHistory(2, 100);
+$evictedTarget = $evicted->add('Alice', 'oldest', 'sender-a');
+$evicted->add('Bob', 'middle', 'sender-b');
+$evictedReply = $evicted->add('Carol', 'newest-reply', 'sender-c', $evictedTarget['id']);
+checkHistory($evicted->find($evictedTarget['id']) === null, 'Capped reply target remained in history.');
+checkHistory($evictedReply['replyToId'] === $evictedTarget['id'], 'Reply lost its reference when the target was capped.');
+
+echo "PASS: server time, expiry, 50-message cap, ordering, unique IDs, and ID-only reply retention.\n";
 

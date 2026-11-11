@@ -43,6 +43,11 @@ checkRoom(
     array_column($rooms->history($upperA['roomKey']), 'text') === ['upper-two', 'upper-three'],
     'First room did not independently retain its latest two messages.',
 );
+$upperHistory = $rooms->history($upperA['roomKey']);
+checkRoom(
+    $rooms->message($upperA['roomKey'], $upperHistory[1]['id'])['text'] === 'upper-three',
+    'Room-scoped message lookup did not find a valid reply target.',
+);
 
 $now += 50;
 $rooms->addMessage($lower['roomKey'], 'SharedName', 'lower-valid', 'sender-lower');

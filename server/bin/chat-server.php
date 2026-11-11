@@ -46,6 +46,8 @@ $room = new ChatRoom(
     (int) $config['room_code_min_length'], (int) $config['room_code_max_length'],
     (int) $config['unjoined_timeout'], (int) $config['max_send_buffer_bytes'],
     (int) $config['connection_chat_limit'], (int) $config['connection_chat_window'],
+    (int) $config['typing_ttl_seconds'], (int) $config['connection_typing_limit'],
+    (int) $config['connection_typing_window'],
     $originPolicy, $ipResolver, $ipLimiter, $identities,
 );
 
@@ -57,6 +59,7 @@ $worker->count = (int) $config['worker_count'];
 $worker->onWorkerStart = static function () use ($room, $config): void {
     Timer::add((int) $config['heartbeat_check_interval'], static fn () => $room->closeStaleConnections());
     Timer::add((int) $config['history_cleanup_interval'], static fn () => $room->pruneExpiredMessages());
+    Timer::add((int) $config['typing_cleanup_interval'], static fn () => $room->pruneTypingStates());
 };
 $worker->onConnect = static fn (TcpConnection $connection) => $room->attach($connection);
 $worker->onWebSocketConnect = static fn (TcpConnection $connection, Request $request) => $room->authorizeHandshake($connection, $request);
