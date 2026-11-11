@@ -152,7 +152,10 @@
     connectionStatus.textContent = label;
   }
 
-  function setComposerFeedback(message = DEFAULT_COMPOSER_HINT, tone = "neutral") {
+  function setComposerFeedback(message = DEFAULT_COMPOSER_HINT, tone = "neutral", overrideUnknown = false) {
+    if (unknownSendOutcome && !overrideUnknown) {
+      return;
+    }
     composerFeedback.textContent = message;
     if (tone === "neutral") {
       composerFeedback.removeAttribute("data-tone");
@@ -700,7 +703,7 @@
     pendingChat = null;
     unknownSendOutcome = true;
     setComposerEnabled(joined && socket?.readyState === WebSocket.OPEN);
-    setComposerFeedback(message, "error");
+    setComposerFeedback(message, "error", true);
   }
 
   function handleChatResult(packet) {
@@ -827,7 +830,7 @@
 
     const reconnectScheduled = scheduleReconnect();
     if (hadPendingChat && reconnectScheduled) {
-      setComposerFeedback("发送结果暂时未知，草稿已保留且不会自动重发；正在恢复连接。", "error");
+      setComposerFeedback("发送结果暂时未知，草稿已保留且不会自动重发；正在恢复连接。", "error", true);
     }
     joinButton.disabled = reconnectScheduled;
     if (!reconnectScheduled && !pageUnloading && !suppressReconnect) {
@@ -897,7 +900,7 @@
         applyHistory(packet.messages);
         setComposerEnabled(true);
         if (unknownSendOutcome) {
-          setComposerFeedback("连接已恢复；上一条发送结果仍未知，草稿已保留且不会自动重发。", "error");
+          setComposerFeedback("连接已恢复；上一条发送结果仍未知，草稿已保留且不会自动重发。", "error", true);
         } else {
           setComposerFeedback();
         }
@@ -909,7 +912,7 @@
         break;
       case "chat":
         appendChat(packet);
-        if (!pendingChat) {
+        if (!pendingChat && !unknownSendOutcome) {
           setComposerFeedback();
         }
         break;
