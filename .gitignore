@@ -1,0 +1,7 @@
+/server/vendor/
+/server/runtime/*.log
+/server/runtime/*.pid
+/server/bin/workerman.log
+/.idea/
+/.vscode/
+

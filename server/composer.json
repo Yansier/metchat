@@ -1,0 +1,21 @@
+{
+  "name": "private-ephemeral-chat/websocket-server",
+  "description": "In-memory-only WebSocket relay for Private Ephemeral Chat",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": "^8.2",
+    "ext-json": "*",
+    "workerman/workerman": "^5.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "PrivateChat\\": "src/"
+    }
+  },
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true
+  }
+}
+
