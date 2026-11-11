@@ -178,8 +178,9 @@ final class ChatRoom
                 $this->handleJoin($connection, $packet); return;
             case 'chat':
                 if (
-                    !$this->hasOnlyKeys($packet, ['type', 'text', 'replyToId'])
+                    !$this->hasOnlyKeys($packet, ['type', 'text', 'replyToId', 'requestId'])
                     || (array_key_exists('replyToId', $packet) && !is_string($packet['replyToId']))
+                    || (array_key_exists('requestId', $packet) && !is_string($packet['requestId']))
                 ) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
                 }
@@ -317,7 +318,11 @@ final class ChatRoom
             'identityRestored' => $identity['restored'],
         ]);
         unset($identity);
-        $this->sendJson($connection, ['type' => 'history', 'messages' => $this->rooms->history($roomKey)]);
+        $this->sendJson($connection, [
+            'type' => 'history',
+            'serverTime' => gmdate('c'),
+            'messages' => $this->rooms->history($roomKey),
+        ]);
         $this->broadcastToRoom($roomKey, ['type' => 'join', 'nickname' => $nickname, 'self' => false, 'joinedAt' => $joinedAt], $connection->id);
         $this->broadcastPresence($roomKey, 'join', $nickname);
         $this->sendMembersSnapshot($roomKey);
@@ -326,36 +331,44 @@ final class ChatRoom
     /** @param array<string, mixed> $packet */
     private function handleChat(TcpConnection $connection, array $packet): void
     {
+        $requestId = null;
+        if (array_key_exists('requestId', $packet)) {
+            $requestId = $packet['requestId'];
+            if (preg_match('/\A[a-f0-9]{32}\z/D', $requestId) !== 1) {
+                $this->sendError($connection, 'invalid_request_id', '发送请求标识无效'); return;
+            }
+        }
+
         $client = $this->clients[$connection->id];
         if ($client['nickname'] === null || $client['room_key'] === null || $client['sender_id'] === null) {
-            $this->sendError($connection, 'join_required', '请先加入房间'); return;
+            $this->sendChatFailure($connection, $requestId, 'join_required', '请先加入房间'); return;
         }
         if (!$this->allowConnectionChat($connection->id) || $client['rate_key'] === null || !$this->ipLimiter->allowChat($client['rate_key'])) {
             ++$this->clients[$connection->id]['rate_violations'];
             if ($this->clients[$connection->id]['rate_violations'] >= 3) {
-                $this->sendErrorAndClose($connection, 'chat_rate_limited', '发送过于频繁，请稍后重试');
+                $this->sendChatFailureAndClose($connection, $requestId, 'chat_rate_limited', '发送过于频繁，请稍后重试');
             } else {
-                $this->sendError($connection, 'chat_rate_limited', '发送过于频繁，请稍后重试');
+                $this->sendChatFailure($connection, $requestId, 'chat_rate_limited', '发送过于频繁，请稍后重试');
             }
             return;
         }
 
         $text = is_string($packet['text'] ?? null) ? trim($packet['text']) : '';
         if ($text === '' || !$this->isValidUtf8($text)) {
-            $this->sendError($connection, 'empty_message', '消息不能为空'); return;
+            $this->sendChatFailure($connection, $requestId, 'empty_message', '消息不能为空'); return;
         }
         if ($this->unicodeLength($text) > $this->maxMessageCharacters) {
-            $this->sendError($connection, 'message_too_long', '消息过长'); return;
+            $this->sendChatFailure($connection, $requestId, 'message_too_long', '消息过长'); return;
         }
 
         $replyToId = null;
         if (array_key_exists('replyToId', $packet)) {
             $replyToId = $packet['replyToId'];
             if (preg_match('/\A[a-f0-9]{32}\z/D', $replyToId) !== 1) {
-                $this->sendError($connection, 'invalid_reply_target', '引用消息标识无效'); return;
+                $this->sendChatFailure($connection, $requestId, 'invalid_reply_target', '引用消息标识无效'); return;
             }
             if ($this->rooms->message($client['room_key'], $replyToId) === null) {
-                $this->sendError($connection, 'reply_target_unavailable', '原消息已过期或不在最近记录中'); return;
+                $this->sendChatFailure($connection, $requestId, 'reply_target_unavailable', '原消息已过期或不在最近记录中'); return;
             }
         }
 
@@ -368,7 +381,62 @@ final class ChatRoom
             $client['sender_id'],
             $replyToId,
         );
+        if ($requestId !== null) {
+            $this->sendJson($connection, [
+                'type' => 'chat_result',
+                'requestId' => $requestId,
+                'ok' => true,
+                'messageId' => $message['id'],
+                'serverTime' => gmdate('c'),
+            ]);
+        }
         $this->broadcastToRoom($client['room_key'], array_merge(['type' => 'chat'], $message));
+    }
+
+    private function sendChatFailure(
+        TcpConnection $connection,
+        ?string $requestId,
+        string $code,
+        string $message,
+    ): void {
+        if ($requestId === null) {
+            $this->sendError($connection, $code, $message);
+            return;
+        }
+
+        $this->sendJson($connection, [
+            'type' => 'chat_result',
+            'requestId' => $requestId,
+            'ok' => false,
+            'code' => $code,
+            'message' => $message,
+            'serverTime' => gmdate('c'),
+        ]);
+    }
+
+    private function sendChatFailureAndClose(
+        TcpConnection $connection,
+        ?string $requestId,
+        string $code,
+        string $message,
+    ): void {
+        if ($requestId === null) {
+            $this->sendErrorAndClose($connection, $code, $message);
+            return;
+        }
+
+        try {
+            $connection->close($this->encode([
+                'type' => 'chat_result',
+                'requestId' => $requestId,
+                'ok' => false,
+                'code' => $code,
+                'message' => $message,
+                'serverTime' => gmdate('c'),
+            ]));
+        } catch (Throwable) {
+            $this->safeClose($connection);
+        }
     }
 
     private function handleTyping(TcpConnection $connection, bool $active): void

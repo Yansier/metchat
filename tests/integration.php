@@ -195,6 +195,7 @@ function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?
     check(is_string($join['identityToken'] ?? null) && $join['identityToken'] !== '', "{$nickname} did not receive an identity credential.");
     check(is_bool($join['identityRestored'] ?? null), "{$nickname} did not receive identity restoration state.");
     $historyPacket = $client->expect('history');
+    check(is_string($historyPacket['serverTime'] ?? null), "{$nickname} did not receive authoritative server time.");
     $client->expect('presence');
     $membersPacket = $client->expect('members');
     $history = $historyPacket['messages'] ?? null;
@@ -384,14 +385,28 @@ try {
     check(($bobMessage['senderId'] ?? null) === $aliceJoin['senderId'], 'Room peer saw a different sender identity.');
     $carol->assertNoType('chat');
 
-    $bob->send(['type' => 'chat', 'text' => $replyText, 'replyToId' => $aliceMessage['id']]);
+    $replyRequestId = bin2hex(random_bytes(16));
+    $bob->send(['type' => 'chat', 'text' => $replyText, 'replyToId' => $aliceMessage['id'], 'requestId' => $replyRequestId]);
+    $replyResult = $bob->expect('chat_result');
+    check(($replyResult['requestId'] ?? null) === $replyRequestId && ($replyResult['ok'] ?? null) === true, 'Reply request was not acknowledged.');
+    check(is_string($replyResult['messageId'] ?? null), 'Successful chat result omitted the server message ID.');
     $aliceReply = $alice->expect('chat');
     $bobReply = $bob->expect('chat');
     check(($aliceReply['replyToId'] ?? null) === $aliceMessage['id'], 'Live reply lost its target ID.');
     check(($bobReply['id'] ?? null) === ($aliceReply['id'] ?? null), 'Reply sender and peer received inconsistent messages.');
+    check(($replyResult['messageId'] ?? null) === ($aliceReply['id'] ?? null), 'Chat result did not identify the broadcast message.');
+    check(!array_key_exists('requestId', $aliceReply), 'Private request ID leaked into a room broadcast.');
+    check(is_string($aliceReply['expiresAt'] ?? null), 'Live message omitted server expiry metadata.');
 
-    $carol->send(['type' => 'chat', 'text' => 'cross-room-reply', 'replyToId' => $aliceMessage['id']]);
-    check(($carol->expect('error')['code'] ?? null) === 'reply_target_unavailable', 'Cross-room reply target was accepted.');
+    $crossRoomRequestId = bin2hex(random_bytes(16));
+    $carol->send(['type' => 'chat', 'text' => 'cross-room-reply', 'replyToId' => $aliceMessage['id'], 'requestId' => $crossRoomRequestId]);
+    $crossRoomResult = $carol->expect('chat_result');
+    check(
+        ($crossRoomResult['requestId'] ?? null) === $crossRoomRequestId
+        && ($crossRoomResult['ok'] ?? null) === false
+        && ($crossRoomResult['code'] ?? null) === 'reply_target_unavailable',
+        'Cross-room reply failure was not correlated.',
+    );
     $carol->assertNoType('chat');
     $bob->send(['type' => 'chat', 'text' => 'missing-reply', 'replyToId' => str_repeat('f', 32)]);
     check(($bob->expect('error')['code'] ?? null) === 'reply_target_unavailable', 'Missing reply target was accepted.');
@@ -399,6 +414,8 @@ try {
     $bob->send(['type' => 'chat', 'text' => 'bad-reply', 'replyToId' => 'not-a-message-id']);
     check(($bob->expect('error')['code'] ?? null) === 'invalid_reply_target', 'Malformed reply target was accepted.');
     $alice->assertNoType('chat');
+    $bob->send(['type' => 'chat', 'text' => 'bad-request-id', 'requestId' => 'client-controlled']);
+    check(($bob->expect('error')['code'] ?? null) === 'invalid_request_id', 'Malformed request ID was accepted.');
 
     $carol->send(['type' => 'chat', 'text' => $bText]);
     check(($carol->expect('chat')['text'] ?? null) === $bText, 'Room B sender echo failed.');
@@ -460,8 +477,32 @@ try {
     check(!historyContainsText($historyA, "cap-b-{$token}-55"), 'Room A cap history contains Room B data.');
     check(!historyContainsText($historyB, "cap-a-{$token}-55"), 'Room B cap history contains Room A data.');
 
+    $evictedReplyRequestId = bin2hex(random_bytes(16));
+    $aliceReloaded->send([
+        'type' => 'chat',
+        'text' => 'reply-to-evicted-target',
+        'replyToId' => $aliceMessage['id'],
+        'requestId' => $evictedReplyRequestId,
+    ]);
+    $evictedReplyResult = $aliceReloaded->expect('chat_result');
+    check(
+        ($evictedReplyResult['requestId'] ?? null) === $evictedReplyRequestId
+        && ($evictedReplyResult['ok'] ?? null) === false
+        && ($evictedReplyResult['code'] ?? null) === 'reply_target_unavailable',
+        'Evicted reply failure was not correlated.',
+    );
+    $aliceReloaded->assertNoType('chat');
+
     // An unjoined connection cannot chat or read history.
     $unjoined = $clients[] = new TestWebSocket();
+    $unjoinedRequestId = bin2hex(random_bytes(16));
+    $unjoined->send(['type' => 'chat', 'text' => 'must-be-correlated', 'requestId' => $unjoinedRequestId]);
+    $unjoinedResult = $unjoined->expect('chat_result');
+    check(
+        ($unjoinedResult['requestId'] ?? null) === $unjoinedRequestId
+        && ($unjoinedResult['code'] ?? null) === 'join_required',
+        'Unjoined chat failure was not correlated.',
+    );
     $unjoined->send(['type' => 'chat', 'text' => 'must-be-rejected']);
     check(($unjoined->expect('error')['code'] ?? null) === 'join_required', 'Unjoined chat was not rejected.');
     $unjoined->send(['type' => 'history']);

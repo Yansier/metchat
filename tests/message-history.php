@@ -21,6 +21,7 @@ $history = new MessageHistory(50, 86_400, static function () use (&$now): int {
 $first = $history->add('Alice', 'kept-for-24-hours', 'sender-alice');
 checkHistory(strlen($first['id']) === 32, 'Server message ID is not a 128-bit hexadecimal value.');
 checkHistory($first['sentAt'] === gmdate('c', $now), 'Message did not use server time.');
+checkHistory($first['expiresAt'] === gmdate('c', $now + 86_400), 'Message did not expose its server expiry time.');
 checkHistory($first['senderId'] === 'sender-alice', 'History did not retain the server sender ID.');
 
 $now += 600;
@@ -54,6 +55,7 @@ $replyTarget = $replies->add('Alice', 'reply-target', 'sender-a');
 $replyNow += 50;
 $reply = $replies->add('Bob', 'reply-body', 'sender-b', $replyTarget['id']);
 checkHistory($reply['replyToId'] === $replyTarget['id'], 'Reply target ID was not retained.');
+checkHistory($reply['expiresAt'] === gmdate('c', $replyNow + 100), 'Reply did not receive an independent expiry time.');
 checkHistory($replies->find($replyTarget['id'])['text'] === 'reply-target', 'Valid reply target was not found.');
 $replyNow += 51;
 $remaining = $replies->all();

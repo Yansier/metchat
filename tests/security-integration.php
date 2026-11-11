@@ -211,6 +211,41 @@ if ($mode === 'lifecycle') {
     exit(0);
 }
 
+if ($mode === 'expiry') {
+    $sender = new SecuritySocket();
+    $reader = null;
+    try {
+        [, $initialHistory] = securityJoin($sender, 'ExpirySender', 'ExpiryRoom_01');
+        securityCheck(is_string($initialHistory['serverTime'] ?? null), 'History omitted authoritative server time.');
+        $requestId = bin2hex(random_bytes(16));
+        $sender->send(['type' => 'chat', 'text' => 'short-lived', 'requestId' => $requestId]);
+        $result = $sender->expect('chat_result');
+        $message = $sender->expect('chat');
+        securityCheck(($result['ok'] ?? null) === true && ($result['messageId'] ?? null) === ($message['id'] ?? null), 'Short-lived message was not acknowledged.');
+        securityCheck(is_string($message['expiresAt'] ?? null), 'Short-lived message omitted expiry metadata.');
+        sleep(3);
+
+        $replyRequestId = bin2hex(random_bytes(16));
+        $sender->send(['type' => 'chat', 'text' => 'expired-reply', 'replyToId' => $message['id'], 'requestId' => $replyRequestId]);
+        $replyResult = $sender->expect('chat_result');
+        securityCheck(
+            ($replyResult['requestId'] ?? null) === $replyRequestId
+            && ($replyResult['ok'] ?? null) === false
+            && ($replyResult['code'] ?? null) === 'reply_target_unavailable',
+            'Expired reply target was not rejected with a correlated result.',
+        );
+
+        $reader = new SecuritySocket();
+        [, $readerHistory] = securityJoin($reader, 'ExpiryReader', 'ExpiryRoom_01');
+        securityCheck(($readerHistory['messages'] ?? null) === [], 'Expired message was returned to a new reader.');
+        echo "PASS: short TTL expires history and rejects an expired reply with a correlated result.\n";
+    } finally {
+        $reader?->close();
+        $sender->close();
+    }
+    exit(0);
+}
+
 if ($mode === 'bounded-load') {
     $clients = [];
     try {
@@ -253,8 +288,15 @@ $client->send(['type' => 'chat', 'text' => 'one']);
 $client->expect('chat');
 $client->send(['type' => 'chat', 'text' => 'two']);
 $client->expect('chat');
-$client->send(['type' => 'chat', 'text' => 'three']);
-securityCheck(($client->expect('error')['code'] ?? null) === 'chat_rate_limited', 'High-frequency chat was not limited.');
+$rateRequestId = bin2hex(random_bytes(16));
+$client->send(['type' => 'chat', 'text' => 'three', 'requestId' => $rateRequestId]);
+$rateResult = $client->expect('chat_result');
+securityCheck(
+    ($rateResult['requestId'] ?? null) === $rateRequestId
+    && ($rateResult['ok'] ?? null) === false
+    && ($rateResult['code'] ?? null) === 'chat_rate_limited',
+    'High-frequency chat was not limited with a correlated result.',
+);
 $client->sendPayload(str_repeat('x', 17_000));
 securityCheck($client->receive(0.5) === null, 'Oversized WebSocket payload was not closed.');
 $client->close();

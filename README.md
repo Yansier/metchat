@@ -28,7 +28,8 @@ private-ephemeral-chat/
 │   ├── composer.lock               # composer install 后生成
 │   └── vendor/                     # composer install 后生成
 ├── deploy/
-│   └── nginx-private-chat.conf
+│   ├── nginx-private-chat.conf
+│   └── PHASE5B1-DEPLOY.md
 ├── tests/
 │   ├── integration.php
 │   ├── anonymous-identity.php
@@ -36,6 +37,7 @@ private-ephemeral-chat/
 │   ├── room-manager.php
 │   ├── security-integration.php
 │   ├── security-unit.php
+│   ├── unknown-outcome-server.php # 浏览器断线竞态测试专用服务
 │   └── static-checks.ps1
 ├── .gitignore
 └── README.md
@@ -49,21 +51,24 @@ private-ephemeral-chat/
 {"type":"join","nickname":"Alice","roomCode":"261110Achat"}
 {"type":"join","nickname":"Alice","roomCode":"261110Achat","identityToken":"可选的服务端签发凭证"}
 {"type":"chat","text":"你好"}
-{"type":"chat","text":"我同意","replyToId":"32位服务端消息ID"}
+{"type":"chat","text":"你好","requestId":"32位客户端随机请求ID"}
+{"type":"chat","text":"我同意","replyToId":"32位服务端消息ID","requestId":"32位客户端随机请求ID"}
 {"type":"typing","active":true}
 {"type":"typing","active":false}
 {"type":"ping","ts":1234567890}
 {"type":"pong"}
 ```
 
-服务端发送 `join`、`history`、`chat`、`presence`、`members`、`typing`、`error`、`pong`。成功加入后的顺序为：
+服务端发送 `join`、`history`、`chat`、`chat_result`、`presence`、`members`、`typing`、`error`、`pong`。成功加入后的顺序为：
 
 1. `join`：加入确认，包含非敏感 `roomId`、房间专属 `senderId`、续期后的 `identityToken` 和凭证到期时间；完整暗号不会回传。
 2. `history`：从旧到新的有效历史快照。
 3. `presence` 和带递增 `version` 的 `members`：当前房间权威在线连接快照。
 4. 后续 `chat`、`typing`：当前房间实时事件。
 
-历史和实时消息都包含服务端生成的 `id`、`nickname`、`text`、`sentAt`、`senderId`，引用消息额外包含 `replyToId`。`chat` 只向当前房间广播，并权威回显给发送者；前端按服务器消息 ID 去重，并只通过 `senderId` 判断左右气泡。旧格式消息缺少 `senderId` 时使用中性样式。
+历史和实时消息都包含服务端生成的 `id`、`nickname`、`text`、`sentAt`、`expiresAt`、`senderId`，引用消息额外包含 `replyToId`。`history` 还包含 `serverTime`，前端据此建立服务器时间锚点并清理已过期 DOM。`chat` 只向当前房间广播，并权威回显给发送者；前端按服务器消息 ID 去重，并只通过 `senderId` 判断左右气泡。旧格式消息缺少 `senderId` 时使用中性样式；缺少 `expiresAt` 时前端不会虚构到期时间，而会等下一次服务器历史同步。
+
+新客户端为每次发送生成 128 位随机 `requestId`。服务端仅在消息完成校验并加入内存历史后，向发起连接返回 `{"type":"chat_result","requestId":"…","ok":true,"messageId":"…","serverTime":"…"}`；可关联失败返回 `ok:false`、`code` 和 `message`。`requestId` 不进入广播或历史。旧客户端不带 `requestId` 时仍可按原协议发送并接收服务端 `chat` 回显。
 
 暗号规则：8–64 位，只允许英文字母、数字、下划线和连字符，区分大小写。服务端只把暗号转换为带进程随机密钥的内部哈希，不把完整暗号写入消息、URL 或日志。
 
@@ -87,6 +92,7 @@ private-ephemeral-chat/
 - 成员加入、退出、异常断开或心跳超时后都会发布新版本快照；客户端忽略旧版本，在线数量必须等于快照数组长度。
 - `typing` 只保存连接内的布尔状态和五秒到期时间，不包含实际输入内容，不进入历史；前端每三秒至多续期一次，服务端还有独立频率限制。
 - 引用回复只保存并广播经过当前房间有效历史验证的 `replyToId`，不复制原正文。目标过期或被 50 条上限淘汰后，回复仍可存在，但界面只显示目标不可用提示。
+- 新客户端在 `chat_result` 成功前保留正文和引用并锁定重复提交；失败保留草稿，断线或十秒超时标记为“结果未知”且不自动重发。确认期间产生的新编辑不会被旧确认清空。
 - 在线成员和输入状态均为 Worker 内存数据，进程重启后全部清空。
 
 ## 本地启动（Linux）
@@ -136,6 +142,13 @@ php tests/integration.php
 
 测试覆盖凭证签名/伪造/续期/过期/重启失效、同昵称身份分离、权威成员快照、旧/新连接重叠清理、输入状态隔离/过期/限流、引用验证/恢复/过期降级、房间专属 senderId、跨房间实时/历史隔离、每房间独立 50 条历史、未加入越权、限流和容量。
 
+短 TTL 的真实 Workerman 生命周期测试可用测试环境变量运行（不要用于生产）：
+
+```bash
+CHAT_HISTORY_TTL_SECONDS=2 CHAT_HISTORY_CLEANUP_INTERVAL=1 php server/bin/chat-server.php start
+php tests/security-integration.php expiry
+```
+
 验证 Workerman 重启清空历史：
 
 ```bash
@@ -169,8 +182,10 @@ powershell -ExecutionPolicy Bypass -File tests/static-checks.ps1
 15. 点击退出后在开发者工具中确认 `sessionStorage` 的匿名凭证已删除；确认其中没有暗号或消息正文。
 16. 打开在线成员面板，确认同昵称、同身份的多个连接分别显示不同短连接标识，主动退出后立即消失。
 17. A、B 同房间输入文字，确认输入提示只出现在对方窗口，停止输入、发送、断线和约五秒超时后消失。
-18. 回复一条消息并刷新，确认引用关系恢复；将引用目标挤出最近 50 条后只显示“原消息已过期或不在最近记录中”。
+18. 回复一条消息并刷新，确认引用关系恢复；将引用目标挤出最近 50 条后只显示“原消息已过期或不在最近记录中”。失败后正文必须仍在输入框，可取消引用再发送。
 19. 在移动端点击回复、取消回复和成员入口，确认底部抽屉及软键盘不会遮挡输入框。
+20. 发送后立刻断开 WebSocket，确认草稿保留、提示结果未知且不会自动重发；等待确认时重复按 Enter 不得产生第二个请求。
+21. 使用测试环境的短 TTL，将页面切到后台后再恢复，确认过期消息及其 Map/Set/DOM 状态被清理，仍有效的引用回复只降级引用摘要而不被删除。
 
 消息交互约定：Enter 发送，Shift+Enter 换行。客户端只显示服务端回显的消息，不做乐观伪发送，也不会自动重试未确认的消息。
 
@@ -209,6 +224,7 @@ php bin/chat-server.php start -d
 - 房间状态只存在单 Worker 进程的 `RoomManager` 数组中。
 - 每个房间拥有独立 `MessageHistory`，最多 50 条。
 - 每 60 秒定时清理过期消息；每次返回历史前也会再次过滤。
+- 前端每 60 秒并在页面恢复可见时，按 `serverTime` 锚点和消息 `expiresAt` 清理过期气泡，同时删除对应 Set/Map 引用并刷新引用摘要。
 - 房间无人在线但仍有有效历史时继续保留；无成员且无历史时释放房间。
 - 聊天正文不写入控制台或应用日志。
 - 完整暗号不进入聊天正文、服务端响应、URL 或应用日志。

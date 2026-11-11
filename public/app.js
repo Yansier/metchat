@@ -54,6 +54,8 @@
   const TYPING_IDLE_DELAY_MS = 2_000;
   const TYPING_REFRESH_INTERVAL_MS = 3_000;
   const REMOTE_TYPING_FALLBACK_MS = 5_500;
+  const CHAT_CONFIRM_TIMEOUT_MS = 10_000;
+  const MESSAGE_EXPIRY_CHECK_INTERVAL_MS = 60_000;
   const REPLY_EXCERPT_CHARACTERS = 72;
   const DEFAULT_COMPOSER_HINT = "Enter 发送 · Shift + Enter 换行";
 
@@ -96,6 +98,10 @@
   let typingIdleTimer = null;
   let typingRefreshTimer = null;
   let isComposing = false;
+  let pendingChat = null;
+  let expiryTimer = null;
+  let serverClockAnchor = null;
+  let unknownSendOutcome = false;
 
   // IDs exist only for this page lifetime and are never persisted.
   const seenMessageIds = new Set();
@@ -157,7 +163,7 @@
 
   function setComposerEnabled(enabled) {
     messageInput.disabled = !enabled;
-    sendButton.disabled = !enabled;
+    sendButton.disabled = !enabled || pendingChat !== null;
 
     if (!enabled && !joined) {
       setComposerFeedback("连接恢复后才能发送消息");
@@ -174,6 +180,38 @@
       hour: "2-digit",
       minute: "2-digit",
     }).format(date);
+  }
+
+  function updateServerClock(serverTime) {
+    const serverTimeMs = typeof serverTime === "string" ? Date.parse(serverTime) : Number.NaN;
+    if (!Number.isFinite(serverTimeMs)) {
+      return false;
+    }
+
+    serverClockAnchor = {
+      serverTimeMs,
+      clientMonotonicMs: performance.now(),
+    };
+    return true;
+  }
+
+  function estimatedServerNow() {
+    if (!serverClockAnchor) {
+      return null;
+    }
+
+    return serverClockAnchor.serverTimeMs + (performance.now() - serverClockAnchor.clientMonotonicMs);
+  }
+
+  function isExpiredMessage(packet) {
+    if (typeof packet?.expiresAt !== "string") {
+      // Older servers did not provide lifecycle metadata. Keep those messages
+      // until a server history refresh rather than inventing an expiry time.
+      return false;
+    }
+    const expiresAt = Date.parse(packet.expiresAt);
+    const serverNow = estimatedServerNow();
+    return Number.isFinite(expiresAt) && serverNow !== null && expiresAt <= serverNow;
   }
 
   function excerpt(value, maximum = REPLY_EXCERPT_CHARACTERS) {
@@ -385,6 +423,18 @@
     replyPreviewText.textContent = "";
   }
 
+  function markReplyUnavailable(messageId, feedback = true) {
+    if (replyTargetId !== messageId) {
+      return;
+    }
+    replyPreviewNickname.textContent = "引用消息";
+    replyPreviewText.textContent = "原消息已过期或不在最近记录中。";
+    replyPreview.hidden = false;
+    if (feedback) {
+      setComposerFeedback("引用目标已失效；可取消引用后保留正文并发送普通消息。", "error");
+    }
+  }
+
   function beginReply(messageId) {
     const target = messagePackets.get(messageId);
     if (!target) {
@@ -423,24 +473,51 @@
     replyContext.replaceChildren(referencedName, referencedText);
   }
 
+  function refreshReplyContexts() {
+    for (const replyContext of messages.querySelectorAll(".message__reply-context")) {
+      populateReplyContext(replyContext, replyContext.dataset.replyToId || "");
+    }
+  }
+
+  function removeRenderedMessage(messageId, reason) {
+    const element = messageElements.get(messageId);
+    element?.remove();
+    seenMessageIds.delete(messageId);
+    messagePackets.delete(messageId);
+    messageElements.delete(messageId);
+    if (replyTargetId === messageId) {
+      markReplyUnavailable(messageId, true);
+    }
+    if (reason === "expired") {
+      refreshReplyContexts();
+    }
+  }
+
   function enforceRenderedMessageLimit() {
     const renderedMessages = [...messages.querySelectorAll(".message")];
     for (const item of renderedMessages.slice(0, -MAX_RENDERED_MESSAGES)) {
       const removedId = item.dataset.messageId;
-      item.remove();
       if (removedId) {
-        seenMessageIds.delete(removedId);
-        messagePackets.delete(removedId);
-        messageElements.delete(removedId);
-        if (replyTargetId === removedId) {
-          clearReply();
-          setComposerFeedback("引用目标已超出最近 50 条消息。", "error");
-        }
+        removeRenderedMessage(removedId, "capped");
+      } else {
+        item.remove();
       }
     }
+    refreshReplyContexts();
+  }
 
-    for (const replyContext of messages.querySelectorAll(".message__reply-context")) {
-      populateReplyContext(replyContext, replyContext.dataset.replyToId || "");
+  function pruneExpiredRenderedMessages() {
+    let removed = false;
+    for (const [messageId, packet] of [...messagePackets]) {
+      if (isExpiredMessage(packet)) {
+        removeRenderedMessage(messageId, "expired");
+        removed = true;
+      }
+    }
+    if (removed) {
+      refreshReplyContexts();
+      updateEmptyState();
+      updateLatestNotice();
     }
   }
 
@@ -481,6 +558,10 @@
       && typeof packet.text === "string"
       && typeof packet.sentAt === "string"
       && (
+        !Object.prototype.hasOwnProperty.call(packet, "expiresAt")
+        || (typeof packet.expiresAt === "string" && Number.isFinite(Date.parse(packet.expiresAt)))
+      )
+      && (
         !Object.prototype.hasOwnProperty.call(packet, "replyToId")
         || (typeof packet.replyToId === "string" && /^[a-f0-9]{32}$/.test(packet.replyToId))
       );
@@ -495,7 +576,7 @@
   }
 
   function appendChat(packet, { autoScroll = true } = {}) {
-    if (!isValidMessage(packet) || seenMessageIds.has(packet.id)) {
+    if (!isValidMessage(packet) || isExpiredMessage(packet) || seenMessageIds.has(packet.id)) {
       return false;
     }
 
@@ -576,6 +657,8 @@
       appendChat(message, { autoScroll: false });
     }
 
+    pruneExpiredRenderedMessages();
+
     hasLoadedHistory = true;
     updateEmptyState();
 
@@ -595,6 +678,74 @@
     } catch {
       return false;
     }
+  }
+
+  function generateRequestId() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+
+  function clearPendingChatTimer() {
+    if (pendingChat?.timer !== null) {
+      window.clearTimeout(pendingChat.timer);
+    }
+  }
+
+  function markPendingChatUnknown(message) {
+    if (!pendingChat) {
+      return;
+    }
+    clearPendingChatTimer();
+    pendingChat = null;
+    unknownSendOutcome = true;
+    setComposerEnabled(joined && socket?.readyState === WebSocket.OPEN);
+    setComposerFeedback(message, "error");
+  }
+
+  function handleChatResult(packet) {
+    if (
+      !pendingChat
+      || typeof packet.requestId !== "string"
+      || packet.requestId !== pendingChat.requestId
+      || typeof packet.ok !== "boolean"
+    ) {
+      return;
+    }
+
+    updateServerClock(packet.serverTime);
+    clearPendingChatTimer();
+    const completed = pendingChat;
+    pendingChat = null;
+    unknownSendOutcome = false;
+    setComposerEnabled(joined && socket?.readyState === WebSocket.OPEN);
+
+    if (packet.ok) {
+      if (typeof packet.messageId !== "string" || !/^[a-f0-9]{32}$/.test(packet.messageId)) {
+        setComposerFeedback("服务器确认格式异常；草稿已保留且不会自动重发。", "error");
+        return;
+      }
+      const composerUnchanged = messageInput.value === completed.draftValue
+        && replyTargetId === completed.replyToId;
+      if (composerUnchanged) {
+        messageInput.value = "";
+        messageInput.rows = 1;
+        clearReply();
+        updateMessageCount();
+        setComposerFeedback("消息已由服务器确认。", "success");
+      } else {
+        setComposerFeedback("消息已确认发送；你后续编辑的新草稿已保留。", "success");
+      }
+      scrollToLatest();
+      messageInput.focus({ preventScroll: true });
+      return;
+    }
+
+    const errorMessage = joinErrorMessage(packet);
+    if (packet.code === "reply_target_unavailable" || packet.code === "invalid_reply_target") {
+      markReplyUnavailable(completed.replyToId, false);
+    }
+    setComposerFeedback(`${errorMessage} 正文和引用状态已保留。`, "error");
   }
 
   function stopHeartbeat() {
@@ -661,6 +812,7 @@
       return;
     }
 
+    const hadPendingChat = pendingChat !== null;
     socket = null;
     joined = false;
     stopHeartbeat();
@@ -668,11 +820,15 @@
     clearRemoteTyping();
     resetMembers();
     setComposerEnabled(false);
+    markPendingChatUnknown("连接在服务器确认前中断；发送结果暂时未知，草稿已保留且不会自动重发。");
     if (roomId) {
       roomStatus.textContent = `ID ${roomId} · 已断开`;
     }
 
     const reconnectScheduled = scheduleReconnect();
+    if (hadPendingChat && reconnectScheduled) {
+      setComposerFeedback("发送结果暂时未知，草稿已保留且不会自动重发；正在恢复连接。", "error");
+    }
     joinButton.disabled = reconnectScheduled;
     if (!reconnectScheduled && !pageUnloading && !suppressReconnect) {
       setStatus("offline", reconnectAttempts >= MAX_RECONNECT_ATTEMPTS ? "重连失败" : "连接已断开");
@@ -737,9 +893,14 @@
         if (!joined) {
           break;
         }
+        updateServerClock(packet.serverTime);
         applyHistory(packet.messages);
         setComposerEnabled(true);
-        setComposerFeedback();
+        if (unknownSendOutcome) {
+          setComposerFeedback("连接已恢复；上一条发送结果仍未知，草稿已保留且不会自动重发。", "error");
+        } else {
+          setComposerFeedback();
+        }
         setStatus("online", "已连接");
         if (focusAfterHistory && window.matchMedia("(pointer: fine)").matches) {
           messageInput.focus({ preventScroll: true });
@@ -748,7 +909,12 @@
         break;
       case "chat":
         appendChat(packet);
-        setComposerFeedback();
+        if (!pendingChat) {
+          setComposerFeedback();
+        }
+        break;
+      case "chat_result":
+        handleChatResult(packet);
         break;
       case "members":
         if (joined) {
@@ -845,6 +1011,9 @@
   }
 
   function clearRoomMessages() {
+    clearPendingChatTimer();
+    pendingChat = null;
+    unknownSendOutcome = false;
     messages.querySelectorAll(".message, .system-message").forEach((item) => item.remove());
     seenMessageIds.clear();
     messagePackets.clear();
@@ -1049,6 +1218,12 @@
 
   messageForm.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (pendingChat) {
+      setComposerFeedback("上一条消息仍在等待服务器确认，请勿重复提交。", "error");
+      return;
+    }
+
+    const draftValue = messageInput.value;
     const text = messageInput.value.trim();
     if (!text) {
       setComposerFeedback("消息不能只包含空白字符。", "error");
@@ -1060,25 +1235,42 @@
       return;
     }
 
-    const chatPacket = { type: "chat", text };
+    let requestId;
+    try {
+      requestId = generateRequestId();
+    } catch {
+      setComposerFeedback("浏览器无法生成安全发送标识，消息没有发送。", "error");
+      return;
+    }
+
+    const chatPacket = { type: "chat", text, requestId };
     if (replyTargetId) {
       chatPacket.replyToId = replyTargetId;
     }
 
     stopLocalTyping(true);
+    pendingChat = {
+      requestId,
+      draftValue,
+      replyToId: replyTargetId,
+      timer: null,
+    };
+    unknownSendOutcome = false;
+    setComposerEnabled(true);
     // Render only the server echo with its authoritative ID and timestamp.
     if (!send(chatPacket)) {
+      pendingChat = null;
+      setComposerEnabled(true);
       setComposerFeedback("发送失败，消息仍保留在输入框中。", "error");
       return;
     }
 
-    clearReply();
-    messageInput.value = "";
-    messageInput.rows = 1;
-    updateMessageCount();
-    setComposerFeedback("已提交，等待服务器确认。", "success");
-    scrollToLatest();
-    messageInput.focus({ preventScroll: true });
+    pendingChat.timer = window.setTimeout(() => {
+      if (pendingChat?.requestId === requestId) {
+        markPendingChatUnknown("服务器确认超时；发送结果暂时未知，草稿已保留且不会自动重发。");
+      }
+    }, CHAT_CONFIRM_TIMEOUT_MS);
+    setComposerFeedback("正在等待服务器确认…");
   });
 
   messageInput.addEventListener("keydown", (event) => {
@@ -1092,7 +1284,7 @@
     resizeMessageInput();
     updateMessageCount();
     noteLocalTyping();
-    if (composerFeedback.dataset.tone === "error") {
+    if (composerFeedback.dataset.tone === "error" && !unknownSendOutcome) {
       setComposerFeedback();
     }
   });
@@ -1148,10 +1340,15 @@
   leaveButton.addEventListener("click", leaveRoom);
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && socket?.readyState === WebSocket.OPEN) {
-      send({ type: "ping", ts: Date.now() });
+    if (document.visibilityState === "visible") {
+      pruneExpiredRenderedMessages();
+      if (socket?.readyState === WebSocket.OPEN) {
+        send({ type: "ping", ts: Date.now() });
+      }
     }
   });
+
+  expiryTimer = window.setInterval(pruneExpiredRenderedMessages, MESSAGE_EXPIRY_CHECK_INTERVAL_MS);
 
   window.visualViewport?.addEventListener("resize", updateViewportHeight, { passive: true });
   window.addEventListener("resize", updateViewportHeight, { passive: true });
@@ -1161,6 +1358,11 @@
     pageUnloading = true;
     clearReconnectTimer();
     stopHeartbeat();
+    if (expiryTimer !== null) {
+      window.clearInterval(expiryTimer);
+      expiryTimer = null;
+    }
+    clearPendingChatTimer();
     stopLocalTyping(false);
     clearRemoteTyping();
     const closingSocket = socket;

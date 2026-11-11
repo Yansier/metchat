@@ -36,7 +36,7 @@ final class MessageHistory
         $this->clock = $clock ?? static fn (): int => time();
     }
 
-    /** @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string} */
+    /** @return array{id: string, nickname: string, text: string, sentAt: string, expiresAt: string, senderId: string, replyToId?: string} */
     public function add(string $nickname, string $text, string $senderId, ?string $replyToId = null): array
     {
         $now = ($this->clock)();
@@ -64,7 +64,7 @@ final class MessageHistory
     /**
      * Expired messages are filtered immediately before every history read.
      *
-     * @return list<array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string}>
+     * @return list<array{id: string, nickname: string, text: string, sentAt: string, expiresAt: string, senderId: string, replyToId?: string}>
      */
     public function all(): array
     {
@@ -93,7 +93,7 @@ final class MessageHistory
         return count($this->messages);
     }
 
-    /** @return null|array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string} */
+    /** @return null|array{id: string, nickname: string, text: string, sentAt: string, expiresAt: string, senderId: string, replyToId?: string} */
     public function find(string $messageId): ?array
     {
         $this->pruneExpired();
@@ -109,7 +109,7 @@ final class MessageHistory
 
     /**
      * @param array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string, expires_at: int} $message
-     * @return array{id: string, nickname: string, text: string, sentAt: string, senderId: string, replyToId?: string}
+     * @return array{id: string, nickname: string, text: string, sentAt: string, expiresAt: string, senderId: string, replyToId?: string}
      */
     private function toPublicMessage(array $message): array
     {
@@ -118,6 +118,7 @@ final class MessageHistory
             'nickname' => $message['nickname'],
             'text' => $message['text'],
             'sentAt' => $message['sentAt'],
+            'expiresAt' => gmdate('c', $message['expires_at']),
             'senderId' => $message['senderId'],
         ];
         if (isset($message['replyToId'])) {
