@@ -724,7 +724,7 @@
   }
 
   function clearPendingChatTimer() {
-    if (pendingChat?.timer !== null) {
+    if (pendingChat?.timer != null) {
       window.clearTimeout(pendingChat.timer);
     }
   }
