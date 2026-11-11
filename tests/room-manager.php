@@ -70,5 +70,49 @@ checkRoom(
     'Cleanup removed another room\'s valid history.',
 );
 
-echo "PASS: case-sensitive isolation, room/member limits, independent history caps, offline retention, expiry isolation, and empty-room release.\n";
+$lifecycleNow = 2_100_000_000;
+$lifecycleClock = static function () use (&$lifecycleNow): int {
+    return $lifecycleNow;
+};
+$lifecycle = new RoomManager(5, 3, 50, 86_400, $lifecycleClock, str_repeat('G', 32), 30);
+
+$normal = $lifecycle->join('NormalRoom_1', 10, ['mode' => 'normal', 'ttlSeconds' => 600]);
+checkRoom($normal['status'] === RoomManager::JOINED && $normal['created'] === true, 'Explicit normal room creation failed.');
+checkRoom($normal['roomMode'] === 'normal' && $normal['ttlSeconds'] === 600, 'Normal room configuration was not authoritative.');
+checkRoom(preg_match('/\A[a-f0-9]{32}\z/D', $normal['roomInstanceId']) === 1, 'Room instance ID format is invalid.');
+$normalConflict = $lifecycle->join('NormalRoom_1', 11, ['mode' => 'ghost', 'ttlSeconds' => 3_600]);
+checkRoom($normalConflict['status'] === RoomManager::ROOM_ALREADY_EXISTS, 'Existing room settings were overwritten by explicit creation.');
+$normalJoin = $lifecycle->join('NormalRoom_1', 11);
+checkRoom($normalJoin['roomInstanceId'] === $normal['roomInstanceId'], 'Ordinary join did not use the existing instance.');
+checkRoom($normalJoin['roomMode'] === 'normal' && $normalJoin['ttlSeconds'] === 600, 'Ordinary join changed room settings.');
+$normalMessage = $lifecycle->addMessage($normal['roomKey'], 'Normal', 'ten-minute-message', 'normal-sender');
+checkRoom($normalMessage['expiresAt'] === gmdate('c', $lifecycleNow + 600), 'Per-room TTL was not applied to a message.');
+$lifecycle->leave($normal['roomKey'], 10);
+$lifecycle->leave($normal['roomKey'], 11);
+checkRoom(count($lifecycle->history($normal['roomKey'])) === 1, 'Normal room history did not survive all members leaving.');
+
+$ghost = $lifecycle->join('GhostRoom_01', 20, ['mode' => 'ghost', 'ttlSeconds' => 3_600]);
+$lifecycle->addMessage($ghost['roomKey'], 'Ghost', 'ghost-history', 'ghost-sender');
+$lifecycleNow += 100;
+$lifecycle->pruneExpired();
+checkRoom($lifecycle->roomCount() === 2, 'Active ghost room was destroyed.');
+$lifecycle->leave($ghost['roomKey'], 20);
+$lifecycleNow += 29;
+$ghostReturn = $lifecycle->join('GhostRoom_01', 21);
+checkRoom($ghostReturn['roomInstanceId'] === $ghost['roomInstanceId'], 'Ghost room was destroyed before grace elapsed.');
+checkRoom(array_column($lifecycle->history($ghost['roomKey']), 'text') === ['ghost-history'], 'Ghost history was lost during grace.');
+$lifecycle->leave($ghost['roomKey'], 21);
+$lifecycleNow += 30;
+$ghostRecreated = $lifecycle->join('GhostRoom_01', 22);
+checkRoom($ghostRecreated['roomInstanceId'] !== $ghost['roomInstanceId'], 'Expired ghost instance was revived at the join boundary.');
+checkRoom($ghostRecreated['roomMode'] === 'normal' && $ghostRecreated['ttlSeconds'] === 86_400, 'Legacy join did not recreate an expired ghost as the default room.');
+checkRoom($lifecycle->history($ghostRecreated['roomKey']) === [], 'Recreated room exposed destroyed ghost history.');
+
+$ghostAgain = $lifecycle->join('GhostRoom_02', 30, ['mode' => 'ghost', 'ttlSeconds' => 600]);
+$lifecycle->leave($ghostAgain['roomKey'], 30);
+$lifecycleNow += 30;
+$ghostCleanup = $lifecycle->pruneExpired();
+checkRoom($ghostCleanup['destroyedGhostRooms'] === 1, 'Periodic cleanup did not destroy an empty ghost room.');
+
+echo "PASS: isolation, limits, per-room TTL, immutable configuration, normal retention, ghost grace, boundary destruction, and instance renewal.\n";
 

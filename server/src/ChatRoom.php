@@ -26,6 +26,7 @@ final class ChatRoom
         private readonly int $heartbeatTimeout,
         int $historyMaxMessages,
         int $historyTtlSeconds,
+        int $ghostGraceSeconds,
         int $maxRooms,
         private readonly int $maxTotalConnections,
         int $maxConnectionsPerRoom,
@@ -44,7 +45,15 @@ final class ChatRoom
         private readonly IpRateLimiter $ipLimiter,
         private readonly AnonymousIdentity $identities,
     ) {
-        $this->rooms = new RoomManager($maxRooms, $maxConnectionsPerRoom, $historyMaxMessages, $historyTtlSeconds);
+        $this->rooms = new RoomManager(
+            $maxRooms,
+            $maxConnectionsPerRoom,
+            $historyMaxMessages,
+            $historyTtlSeconds,
+            null,
+            null,
+            $ghostGraceSeconds,
+        );
     }
 
     public function attach(TcpConnection $connection): void
@@ -162,7 +171,7 @@ final class ChatRoom
             return;
         }
         unset($rawFrame);
-        if (!is_array($packet) || array_is_list($packet) || count($packet) > 4 || !isset($packet['type']) || !is_string($packet['type'])) {
+        if (!is_array($packet) || array_is_list($packet) || count($packet) > 5 || !isset($packet['type']) || !is_string($packet['type'])) {
             $this->sendError($connection, 'invalid_packet', '消息结构无效');
             return;
         }
@@ -170,8 +179,9 @@ final class ChatRoom
         switch ($packet['type']) {
             case 'join':
                 if (
-                    !$this->hasOnlyKeys($packet, ['type', 'nickname', 'roomCode', 'identityToken'])
+                    !$this->hasOnlyKeys($packet, ['type', 'nickname', 'roomCode', 'identityToken', 'createOptions'])
                     || (array_key_exists('identityToken', $packet) && !is_string($packet['identityToken']))
+                    || (array_key_exists('createOptions', $packet) && !is_array($packet['createOptions']))
                 ) {
                     $this->sendError($connection, 'invalid_packet', '消息结构无效'); return;
                 }
@@ -219,7 +229,7 @@ final class ChatRoom
         }
     }
 
-    /** @return array{expiredMessages: int, releasedRooms: int} */
+    /** @return array{expiredMessages: int, releasedRooms: int, destroyedGhostRooms: int} */
     public function pruneExpiredMessages(): array
     {
         $this->ipLimiter->prune();
@@ -283,17 +293,41 @@ final class ChatRoom
             $this->sendError($connection, 'invalid_room_code', '房间暗号格式无效'); return;
         }
 
+        $createOptions = null;
+        if (array_key_exists('createOptions', $packet)) {
+            $candidate = $packet['createOptions'];
+            if (
+                array_is_list($candidate)
+                || !$this->hasOnlyKeys($candidate, ['mode', 'ttlSeconds'])
+                || count($candidate) !== 2
+                || !is_string($candidate['mode'] ?? null)
+                || !is_int($candidate['ttlSeconds'] ?? null)
+            ) {
+                $this->sendError($connection, 'invalid_create_options', '房间创建设置无效'); return;
+            }
+            if (!in_array($candidate['mode'], [RoomManager::MODE_NORMAL, RoomManager::MODE_GHOST], true)) {
+                $this->sendError($connection, 'invalid_room_mode', '房间模式无效'); return;
+            }
+            if (!in_array($candidate['ttlSeconds'], RoomManager::ALLOWED_TTL_SECONDS, true)) {
+                $this->sendError($connection, 'invalid_room_ttl', '消息有效期无效'); return;
+            }
+            $createOptions = ['mode' => $candidate['mode'], 'ttlSeconds' => $candidate['ttlSeconds']];
+        }
+
         $identityToken = is_string($packet['identityToken'] ?? null) ? $packet['identityToken'] : null;
         $identity = $this->identities->resolve($identityToken);
         unset($identityToken);
 
-        $joinResult = $this->rooms->join($roomCode, $connection->id);
+        $joinResult = $this->rooms->join($roomCode, $connection->id, $createOptions);
         unset($roomCode);
         if ($joinResult['status'] === RoomManager::ROOM_LIMIT_REACHED) {
             $this->sendError($connection, 'room_capacity', '当前房间数量已达上限，请稍后重试'); return;
         }
         if ($joinResult['status'] === RoomManager::ROOM_FULL) {
             $this->sendError($connection, 'room_full', '当前房间在线人数已达上限'); return;
+        }
+        if ($joinResult['status'] === RoomManager::ROOM_ALREADY_EXISTS) {
+            $this->sendError($connection, 'room_already_exists', '该暗号对应的房间已存在，请改为加入房间或使用其他暗号'); return;
         }
 
         $roomKey = $joinResult['roomKey'];
@@ -309,6 +343,10 @@ final class ChatRoom
             'type' => 'join',
             'nickname' => $nickname,
             'roomId' => $joinResult['roomId'],
+            'roomInstanceId' => $joinResult['roomInstanceId'],
+            'roomMode' => $joinResult['roomMode'],
+            'ttlSeconds' => $joinResult['ttlSeconds'],
+            'ghostGraceSeconds' => $joinResult['ghostGraceSeconds'],
             'self' => true,
             'joinedAt' => $joinedAt,
             'senderId' => $senderId,

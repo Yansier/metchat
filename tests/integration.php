@@ -176,19 +176,27 @@ function check(bool $condition, string $message): void
 }
 
 /**
- * @return array{history: list<array<string, mixed>>, roomId: string, senderId: string, memberId: string, identityToken: string, identityRestored: bool, membersVersion: int, members: list<array<string, mixed>>}
+ * @param null|array{mode: string, ttlSeconds: int} $createOptions
+ * @return array{history: list<array<string, mixed>>, roomId: string, roomInstanceId: string, roomMode: string, ttlSeconds: int, ghostGraceSeconds: int, senderId: string, memberId: string, identityToken: string, identityRestored: bool, membersVersion: int, members: list<array<string, mixed>>}
  */
-function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?string $identityToken = null): array
+function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?string $identityToken = null, ?array $createOptions = null): array
 {
     $packet = ['type' => 'join', 'nickname' => $nickname, 'roomCode' => $roomCode];
     if ($identityToken !== null) {
         $packet['identityToken'] = $identityToken;
+    }
+    if ($createOptions !== null) {
+        $packet['createOptions'] = $createOptions;
     }
     $client->send($packet);
     unset($packet);
     $join = $client->expect('join');
     check(($join['self'] ?? false) === true, "{$nickname} did not receive a join acknowledgement.");
     check(is_string($join['roomId'] ?? null), "{$nickname} did not receive a safe room identifier.");
+    check(is_string($join['roomInstanceId'] ?? null) && preg_match('/\A[a-f0-9]{32}\z/D', $join['roomInstanceId']) === 1, "{$nickname} did not receive a room instance ID.");
+    check(in_array($join['roomMode'] ?? null, ['normal', 'ghost'], true), "{$nickname} did not receive an authoritative room mode.");
+    check(in_array($join['ttlSeconds'] ?? null, [600, 3_600, 86_400], true), "{$nickname} did not receive an authoritative room TTL.");
+    check(is_int($join['ghostGraceSeconds'] ?? null) && $join['ghostGraceSeconds'] > 0, "{$nickname} did not receive the ghost grace duration.");
     check(!array_key_exists('roomCode', $join), 'Join response exposed a full room code.');
     check(is_string($join['senderId'] ?? null) && $join['senderId'] !== '', "{$nickname} did not receive a sender ID.");
     check(is_string($join['memberId'] ?? null) && preg_match('/\A[a-f0-9]{32}\z/D', $join['memberId']) === 1, "{$nickname} did not receive a member ID.");
@@ -208,6 +216,10 @@ function joinClient(TestWebSocket $client, string $nickname, string $roomCode, ?
     return [
         'history' => $history,
         'roomId' => $join['roomId'],
+        'roomInstanceId' => $join['roomInstanceId'],
+        'roomMode' => $join['roomMode'],
+        'ttlSeconds' => $join['ttlSeconds'],
+        'ghostGraceSeconds' => $join['ghostGraceSeconds'],
         'senderId' => $join['senderId'],
         'memberId' => $join['memberId'],
         'identityToken' => $join['identityToken'],
@@ -300,8 +312,92 @@ if ($mode === 'identity-restart') {
     exit(0);
 }
 
+if ($mode === 'phase5c') {
+    $suffix = bin2hex(random_bytes(4));
+    $normalCode = "Normal5C_{$suffix}";
+    $ghostCode = "Ghost5C_{$suffix}";
+    $phaseClients = [];
+    try {
+        $normalCreator = $phaseClients[] = new TestWebSocket();
+        $normal = joinClient($normalCreator, 'NormalCreator', $normalCode, null, ['mode' => 'normal', 'ttlSeconds' => 600]);
+        check($normal['roomMode'] === 'normal' && $normal['ttlSeconds'] === 600, 'Custom normal configuration was not applied.');
+
+        $conflict = $phaseClients[] = new TestWebSocket();
+        $conflict->send([
+            'type' => 'join', 'nickname' => 'Conflict', 'roomCode' => $normalCode,
+            'createOptions' => ['mode' => 'ghost', 'ttlSeconds' => 3_600],
+        ]);
+        check(($conflict->expect('error')['code'] ?? null) === 'room_already_exists', 'Existing room creation was not rejected.');
+
+        $ordinary = $phaseClients[] = new TestWebSocket();
+        $ordinaryJoin = joinClient($ordinary, 'Ordinary', $normalCode);
+        check($ordinaryJoin['roomInstanceId'] === $normal['roomInstanceId'], 'Ordinary join changed the room instance.');
+        check($ordinaryJoin['roomMode'] === 'normal' && $ordinaryJoin['ttlSeconds'] === 600, 'Ordinary join changed existing settings.');
+        $normalCreator->expect('join');
+        $normalCreator->expect('presence');
+        $normalCreator->expect('members');
+
+        $invalidMode = $phaseClients[] = new TestWebSocket();
+        $invalidMode->send([
+            'type' => 'join', 'nickname' => 'Invalid', 'roomCode' => "InvalidM_{$suffix}",
+            'createOptions' => ['mode' => 'hidden', 'ttlSeconds' => 600],
+        ]);
+        check(($invalidMode->expect('error')['code'] ?? null) === 'invalid_room_mode', 'Invalid room mode was accepted.');
+        $invalidTtl = $phaseClients[] = new TestWebSocket();
+        $invalidTtl->send([
+            'type' => 'join', 'nickname' => 'Invalid', 'roomCode' => "InvalidT_{$suffix}",
+            'createOptions' => ['mode' => 'ghost', 'ttlSeconds' => 601],
+        ]);
+        check(($invalidTtl->expect('error')['code'] ?? null) === 'invalid_room_ttl', 'Invalid room TTL was accepted.');
+
+        $ghostCreator = $phaseClients[] = new TestWebSocket();
+        $ghost = joinClient($ghostCreator, 'GhostCreator', $ghostCode, null, ['mode' => 'ghost', 'ttlSeconds' => 600]);
+        check($ghost['roomMode'] === 'ghost' && $ghost['ttlSeconds'] === 600, 'Ghost room creation failed.');
+        check($ghost['ghostGraceSeconds'] <= 5, 'Phase 5C integration requires CHAT_GHOST_GRACE_SECONDS <= 5.');
+        $ghostCreator->send(['type' => 'chat', 'text' => "ghost-history-{$suffix}"]);
+        $ghostCreator->expect('chat');
+        $ghostCreator->close();
+        usleep(($ghost['ghostGraceSeconds'] + 1) * 1_000_000);
+
+        $recreatedClient = $phaseClients[] = new TestWebSocket();
+        $recreated = joinClient($recreatedClient, 'AfterGhost', $ghostCode);
+        check($recreated['roomInstanceId'] !== $ghost['roomInstanceId'], 'Expired ghost instance was revived by real Workerman.');
+        check($recreated['roomMode'] === 'normal' && $recreated['ttlSeconds'] === 86_400, 'Legacy join did not create default settings after ghost destruction.');
+        check($recreated['history'] === [], 'Destroyed ghost history leaked into the new instance.');
+
+        echo "PASS: real Workerman explicit creation, immutable settings, strict options, ghost destruction, and instance renewal.\n";
+    } finally {
+        closeAll($phaseClients);
+    }
+    exit(0);
+}
+
+if ($mode === 'phase5c-heartbeat') {
+    $suffix = bin2hex(random_bytes(4));
+    $roomCode = "GhostHB_{$suffix}";
+    $silent = new TestWebSocket();
+    $replacement = null;
+    try {
+        $created = joinClient($silent, 'SilentGhost', $roomCode, null, ['mode' => 'ghost', 'ttlSeconds' => 600]);
+        check($created['ghostGraceSeconds'] <= 5, 'Heartbeat ghost test requires CHAT_GHOST_GRACE_SECONDS <= 5.');
+        $silent->send(['type' => 'chat', 'text' => "heartbeat-ghost-{$suffix}"]);
+        $silent->expect('chat');
+        // Do not ping or close: the server must release this last connection on heartbeat timeout.
+        sleep($created['ghostGraceSeconds'] + 4);
+        $replacement = new TestWebSocket();
+        $after = joinClient($replacement, 'AfterHeartbeat', $roomCode);
+        check($after['roomInstanceId'] !== $created['roomInstanceId'], 'Heartbeat-released ghost room was not destroyed.');
+        check($after['history'] === [], 'Heartbeat-released ghost history leaked into the replacement room.');
+        echo "PASS: heartbeat timeout starts ghost grace and releases the expired instance.\n";
+    } finally {
+        $replacement?->close();
+        $silent->close();
+    }
+    exit(0);
+}
+
 if ($mode !== 'full') {
-    throw new InvalidArgumentException('Mode must be full, seed-restart, verify-restart, or identity-restart.');
+    throw new InvalidArgumentException('Mode must be full, seed-restart, verify-restart, identity-restart, phase5c, or phase5c-heartbeat.');
 }
 
 $clients = [];

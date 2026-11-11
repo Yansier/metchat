@@ -19,7 +19,7 @@
         <span class="brand-mark" aria-hidden="true"><span></span></span>
         <div>
           <p class="brand-name">Private Chat</p>
-          <p class="brand-tagline">24 小时内存会话</p>
+          <p class="brand-tagline">临时内存会话</p>
         </div>
       </div>
       <div class="connection" data-state="idle" aria-live="polite" aria-atomic="true">
@@ -37,7 +37,7 @@
         <div class="privacy-points" aria-label="隐私说明">
           <div>
             <span class="point-icon" aria-hidden="true">01</span>
-            <p><strong>24 小时</strong><span>消息自动过期</span></p>
+            <p><strong>可选时长</strong><span>消息自动过期</span></p>
           </div>
           <div>
             <span class="point-icon" aria-hidden="true">02</span>
@@ -75,10 +75,39 @@
             <p id="roomCodeFeedback" class="field-feedback" role="status" aria-live="polite"></p>
           </div>
 
-          <button id="joinButton" class="join-submit" type="submit">
-            <span>进入聊天室</span>
-            <span aria-hidden="true">→</span>
-          </button>
+          <fieldset id="createOptionsPanel" class="create-options" hidden>
+            <legend>创建房间设置</legend>
+            <div class="create-options__grid">
+              <label>
+                <span>房间模式</span>
+                <select id="roomMode" name="roomMode">
+                  <option value="normal" selected>普通房间</option>
+                  <option value="ghost">幽灵房间</option>
+                </select>
+              </label>
+              <label>
+                <span>消息有效期</span>
+                <select id="roomTtl" name="roomTtl">
+                  <option value="600">10 分钟</option>
+                  <option value="3600">1 小时</option>
+                  <option value="86400" selected>24 小时</option>
+                </select>
+              </label>
+            </div>
+            <p id="roomModeExplanation" class="field-hint">普通房间在全部离开后仍保留尚未过期的留言。</p>
+          </fieldset>
+
+          <div class="join-actions">
+            <button id="joinButton" class="join-submit" type="submit">
+              <span>加入房间</span>
+              <span aria-hidden="true">→</span>
+            </button>
+            <button id="createRoomButton" class="join-submit join-submit--secondary" type="button" aria-expanded="false" aria-controls="createOptionsPanel">
+              <span>创建房间</span>
+              <span aria-hidden="true">＋</span>
+            </button>
+          </div>
+          <p class="create-note">直接加入不存在的暗号时，会兼容旧版行为并创建普通房间，消息保留 24 小时。</p>
           <p id="joinError" class="form-error" role="alert" aria-live="assertive"></p>
         </form>
 
@@ -99,6 +128,7 @@
             <span aria-hidden="true">·</span>
             <span><strong id="onlineCount">0</strong> 个连接在线</span>
           </p>
+          <p id="roomPolicy" class="room-policy">等待服务器确认房间设置</p>
         </div>
 
         <div class="room-actions">
@@ -124,7 +154,7 @@
       </div>
 
       <div class="message-stage">
-        <ol id="messages" class="messages" tabindex="0" aria-live="polite" aria-relevant="additions" aria-label="最近 24 小时的聊天消息">
+        <ol id="messages" class="messages" tabindex="0" aria-live="polite" aria-relevant="additions" aria-label="当前房间的有效聊天消息">
           <li id="historyLoading" class="history-loading" role="status">
             <span class="loading-dots" aria-hidden="true"><i></i><i></i><i></i></span>
             <span>正在恢复最近消息</span>
@@ -164,7 +194,7 @@
           <span class="send-button__arrow" aria-hidden="true">↗</span>
         </button>
       </form>
-      <p class="privacy-note">最多 50 条 · 仅保留 24 小时 · 服务重启即清空</p>
+      <p id="roomRetentionNote" class="privacy-note">最多 50 条 · 仅在服务器内存保留 · 服务重启即清空</p>
     </section>
   </main>
 

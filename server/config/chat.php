@@ -46,6 +46,8 @@ return [
     'unjoined_timeout' => $envInt('CHAT_UNJOINED_TIMEOUT', 15),
     'history_cleanup_interval' => $envInt('CHAT_HISTORY_CLEANUP_INTERVAL', 60),
     'history_ttl_seconds' => $envInt('CHAT_HISTORY_TTL_SECONDS', 86_400),
+    'ghost_grace_seconds' => $envInt('CHAT_GHOST_GRACE_SECONDS', 30),
+    'room_lifecycle_cleanup_interval' => $envInt('CHAT_ROOM_LIFECYCLE_CLEANUP_INTERVAL', 1),
     'history_max_messages' => 50,
     'max_rooms' => 100,
     'max_total_connections' => 64,

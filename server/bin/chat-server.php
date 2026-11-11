@@ -41,6 +41,7 @@ $room = new ChatRoom(
     (int) $config['max_frame_bytes'], (int) $config['max_nickname_characters'],
     (int) $config['max_message_characters'], (int) $config['heartbeat_timeout'],
     (int) $config['history_max_messages'], (int) $config['history_ttl_seconds'],
+    (int) $config['ghost_grace_seconds'],
     (int) $config['max_rooms'], (int) $config['max_total_connections'],
     (int) $config['max_connections_per_room'], (int) $config['max_join_attempts_per_connection'],
     (int) $config['room_code_min_length'], (int) $config['room_code_max_length'],
@@ -59,6 +60,7 @@ $worker->count = (int) $config['worker_count'];
 $worker->onWorkerStart = static function () use ($room, $config): void {
     Timer::add((int) $config['heartbeat_check_interval'], static fn () => $room->closeStaleConnections());
     Timer::add((int) $config['history_cleanup_interval'], static fn () => $room->pruneExpiredMessages());
+    Timer::add((int) $config['room_lifecycle_cleanup_interval'], static fn () => $room->pruneExpiredMessages());
     Timer::add((int) $config['typing_cleanup_interval'], static fn () => $room->pruneTypingStates());
 };
 $worker->onConnect = static fn (TcpConnection $connection) => $room->attach($connection);

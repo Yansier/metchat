@@ -46,7 +46,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -437,7 +438,8 @@ textarea::placeholder {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   background: rgb(5 11 19 / 82%);
   border-color: rgb(76 201 240 / 58%);
   box-shadow: 0 0 0 4px rgb(76 201 240 / 9%);
@@ -493,6 +495,67 @@ textarea:focus {
 .join-submit:not(:disabled):hover {
   box-shadow: 0 14px 34px rgb(55 203 231 / 24%);
   transform: translateY(-1px);
+}
+
+.create-options {
+  margin: 16px 0 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 2%);
+}
+
+.create-options legend {
+  padding: 0 6px;
+  color: var(--muted-strong);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.create-options__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.create-options__grid label {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  color: var(--muted-strong);
+  font-size: 0.7rem;
+  font-weight: 650;
+}
+
+select {
+  min-width: 0;
+  min-height: 43px;
+  padding: 0 11px;
+  border-radius: 10px;
+}
+
+.join-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.join-actions .join-submit {
+  margin-top: 18px;
+}
+
+.join-submit--secondary {
+  color: var(--accent-strong);
+  background: rgb(76 201 240 / 8%);
+  border: 1px solid rgb(76 201 240 / 24%);
+  box-shadow: none;
+}
+
+.create-note {
+  margin: 9px 2px 0;
+  color: var(--muted);
+  font-size: 0.66rem;
+  line-height: 1.5;
 }
 
 .form-error {
@@ -702,6 +765,13 @@ textarea:focus {
 
 .room-subtitle strong {
   color: var(--success);
+}
+
+.room-policy {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
 }
 
 .room-actions {
@@ -1185,6 +1255,15 @@ noscript {
     width: min(100%, 500px);
     margin-right: auto;
     margin-left: auto;
+  }
+
+  .create-options__grid,
+  .join-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .join-actions .join-submit + .join-submit {
+    margin-top: 0;
   }
 
   .join-copy h1 {

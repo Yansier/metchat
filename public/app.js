@@ -5,6 +5,11 @@
   const chatPanel = document.querySelector("#chatPanel");
   const joinForm = document.querySelector("#joinForm");
   const joinButton = document.querySelector("#joinButton");
+  const createRoomButton = document.querySelector("#createRoomButton");
+  const createOptionsPanel = document.querySelector("#createOptionsPanel");
+  const roomModeInput = document.querySelector("#roomMode");
+  const roomTtlInput = document.querySelector("#roomTtl");
+  const roomModeExplanation = document.querySelector("#roomModeExplanation");
   const nicknameInput = document.querySelector("#nickname");
   const roomCodeInput = document.querySelector("#roomCode");
   const toggleRoomCodeButton = document.querySelector("#toggleRoomCodeButton");
@@ -36,6 +41,8 @@
   const cancelReplyButton = document.querySelector("#cancelReplyButton");
   const currentNickname = document.querySelector("#currentNickname");
   const roomStatus = document.querySelector("#roomStatus");
+  const roomPolicy = document.querySelector("#roomPolicy");
+  const roomRetentionNote = document.querySelector("#roomRetentionNote");
   const composerFeedback = document.querySelector("#composerFeedback");
   const messageCount = document.querySelector("#messageCount");
   const connection = document.querySelector(".connection");
@@ -70,12 +77,23 @@
     invalid_reply_target: "引用消息标识无效，请重新选择回复对象。",
     reply_target_unavailable: "原消息已过期或不在最近记录中。",
     typing_rate_limited: "输入状态更新过于频繁，聊天消息仍可正常发送。",
+    invalid_create_options: "房间创建设置无效，请重新选择。",
+    invalid_room_mode: "房间模式无效，请重新选择。",
+    invalid_room_ttl: "消息有效期无效，请重新选择。",
+    room_already_exists: "该暗号对应的房间已存在，请改为加入房间或使用其他暗号。",
   };
 
   let socket = null;
   let nickname = "";
   let roomCode = "";
   let roomId = "";
+  let roomInstanceId = "";
+  let roomMode = "normal";
+  let roomTtlSeconds = 86_400;
+  let ghostGraceSeconds = 30;
+  let createOptionsForJoin = null;
+  let joinIntent = "join";
+  let instanceChangedPending = false;
   let identityToken = readIdentityToken();
   let currentSenderId = "";
   let currentMemberId = "";
@@ -183,6 +201,21 @@
       hour: "2-digit",
       minute: "2-digit",
     }).format(date);
+  }
+
+  function formatTtl(ttlSeconds) {
+    return ttlSeconds === 600 ? "10 分钟" : ttlSeconds === 3_600 ? "1 小时" : "24 小时";
+  }
+
+  function updateRoomPolicy() {
+    const ttlLabel = formatTtl(roomTtlSeconds);
+    if (roomMode === "ghost") {
+      roomPolicy.textContent = `幽灵房间 · 全员离开 ${ghostGraceSeconds} 秒后销毁`;
+      roomRetentionNote.textContent = `最多 50 条 · 消息最长保留 ${ttlLabel} · 全员离开 ${ghostGraceSeconds} 秒后销毁`;
+    } else {
+      roomPolicy.textContent = `普通房间 · 消息保留 ${ttlLabel}`;
+      roomRetentionNote.textContent = `最多 50 条 · 消息保留 ${ttlLabel} · 服务重启即清空`;
+    }
   }
 
   function updateServerClock(serverTime) {
@@ -833,6 +866,7 @@
       setComposerFeedback("发送结果暂时未知，草稿已保留且不会自动重发；正在恢复连接。", "error", true);
     }
     joinButton.disabled = reconnectScheduled;
+    createRoomButton.disabled = reconnectScheduled;
     if (!reconnectScheduled && !pageUnloading && !suppressReconnect) {
       setStatus("offline", reconnectAttempts >= MAX_RECONNECT_ATTEMPTS ? "重连失败" : "连接已断开");
       reconnectButton.hidden = chatPanel.hidden;
@@ -866,6 +900,20 @@
     switch (packet.type) {
       case "join":
         if (packet.self === true) {
+          const nextRoomInstanceId = typeof packet.roomInstanceId === "string"
+            && /^[a-f0-9]{32}$/.test(packet.roomInstanceId)
+            ? packet.roomInstanceId
+            : "";
+          if (roomInstanceId && nextRoomInstanceId && roomInstanceId !== nextRoomInstanceId) {
+            clearRenderedRoomState();
+            instanceChangedPending = true;
+          }
+          roomInstanceId = nextRoomInstanceId;
+          roomMode = packet.roomMode === "ghost" ? "ghost" : "normal";
+          roomTtlSeconds = [600, 3_600, 86_400].includes(packet.ttlSeconds) ? packet.ttlSeconds : 86_400;
+          ghostGraceSeconds = Number.isInteger(packet.ghostGraceSeconds) && packet.ghostGraceSeconds > 0
+            ? packet.ghostGraceSeconds
+            : 30;
           currentSenderId = typeof packet.senderId === "string" ? packet.senderId : "";
           currentMemberId = typeof packet.memberId === "string" ? packet.memberId : "";
           if (
@@ -882,9 +930,12 @@
           chatPanel.hidden = false;
           reconnectButton.hidden = true;
           joinButton.disabled = false;
+          createRoomButton.disabled = false;
+          createOptionsForJoin = null;
           roomId = typeof packet.roomId === "string" ? packet.roomId : "";
           currentNickname.textContent = nickname;
           roomStatus.textContent = roomId ? `ID ${roomId}` : "私人房间";
+          updateRoomPolicy();
           historyLoading.hidden = hasLoadedHistory;
           setComposerEnabled(false);
           setStatus("connecting", "正在恢复消息");
@@ -898,6 +949,10 @@
         }
         updateServerClock(packet.serverTime);
         applyHistory(packet.messages);
+        if (instanceChangedPending) {
+          appendSystem("原房间已结束，当前已进入新的房间会话。");
+          instanceChangedPending = false;
+        }
         setComposerEnabled(true);
         if (unknownSendOutcome) {
           setComposerFeedback("连接已恢复；上一条发送结果仍未知，草稿已保留且不会自动重发。", "error", true);
@@ -952,6 +1007,7 @@
             reconnectButton.hidden = false;
           }
           joinButton.disabled = false;
+          createRoomButton.disabled = false;
           sourceSocket.close();
         } else {
           setComposerFeedback(errorMessage, "error");
@@ -976,12 +1032,14 @@
       joinError.textContent = "当前浏览器不支持 WebSocket，请更换现代浏览器。";
       setStatus("offline", "浏览器不支持");
       joinButton.disabled = false;
+      createRoomButton.disabled = false;
       return;
     }
 
     clearReconnectTimer();
     joinError.textContent = "";
     joinButton.disabled = true;
+    createRoomButton.disabled = true;
     reconnectButton.hidden = true;
     const reconnecting = hasLoadedHistory || reconnectAttempts > 0;
     setStatus(reconnecting ? "reconnecting" : "connecting", reconnecting ? "正在重新连接" : "正在连接");
@@ -996,6 +1054,9 @@
       const joinPacket = { type: "join", nickname, roomCode };
       if (identityToken) {
         joinPacket.identityToken = identityToken;
+      }
+      if (createOptionsForJoin) {
+        joinPacket.createOptions = { ...createOptionsForJoin };
       }
       send(joinPacket);
     });
@@ -1013,10 +1074,9 @@
     });
   }
 
-  function clearRoomMessages() {
-    clearPendingChatTimer();
-    pendingChat = null;
-    unknownSendOutcome = false;
+  function clearRenderedRoomState() {
+    clearRemoteTyping();
+    resetMembers();
     messages.querySelectorAll(".message, .system-message").forEach((item) => item.remove());
     seenMessageIds.clear();
     messagePackets.clear();
@@ -1027,6 +1087,13 @@
     emptyState.hidden = true;
     unseenMessageCount = 0;
     latestButton.hidden = true;
+  }
+
+  function clearRoomMessages() {
+    clearPendingChatTimer();
+    pendingChat = null;
+    unknownSendOutcome = false;
+    clearRenderedRoomState();
   }
 
   function leaveRoom() {
@@ -1045,6 +1112,12 @@
     nickname = "";
     roomCode = "";
     roomId = "";
+    roomInstanceId = "";
+    roomMode = "normal";
+    roomTtlSeconds = 86_400;
+    ghostGraceSeconds = 30;
+    createOptionsForJoin = null;
+    instanceChangedPending = false;
     currentSenderId = "";
     resetMembers();
     clearIdentityToken();
@@ -1059,10 +1132,19 @@
     copyRoomCodeButton.disabled = true;
     roomCodeFeedback.textContent = "";
     roomCodeFeedback.removeAttribute("data-tone");
+    createOptionsPanel.hidden = true;
+    createRoomButton.disabled = false;
+    createRoomButton.setAttribute("aria-expanded", "false");
+    createRoomButton.querySelector("span").textContent = "创建房间";
+    roomModeInput.value = "normal";
+    roomTtlInput.value = "86400";
+    roomModeExplanation.textContent = "普通房间在全部离开后仍保留尚未过期的留言。";
     messageInput.value = "";
     messageInput.rows = 1;
     messageCount.textContent = `0 / ${MAX_MESSAGE_CHARACTERS}`;
     currentNickname.textContent = "未加入";
+    roomPolicy.textContent = "等待服务器确认房间设置";
+    roomRetentionNote.textContent = "最多 50 条 · 仅在服务器内存保留 · 服务重启即清空";
     roomStatus.textContent = "等待加入";
     onlineCount.textContent = "0";
     chatPanel.hidden = true;
@@ -1188,6 +1270,28 @@
     setRoomCodeFeedback();
   });
 
+  roomModeInput.addEventListener("change", () => {
+    roomModeExplanation.textContent = roomModeInput.value === "ghost"
+      ? "幽灵房间在最后一个连接离开后开始 30 秒宽限；期间无人回来才会清空。"
+      : "普通房间在全部离开后仍保留尚未过期的留言。";
+  });
+
+  joinButton.addEventListener("click", () => {
+    joinIntent = "join";
+  });
+
+  createRoomButton.addEventListener("click", () => {
+    if (createOptionsPanel.hidden) {
+      createOptionsPanel.hidden = false;
+      createRoomButton.setAttribute("aria-expanded", "true");
+      createRoomButton.querySelector("span").textContent = "创建并进入";
+      roomModeInput.focus({ preventScroll: true });
+      return;
+    }
+    joinIntent = "create";
+    joinForm.requestSubmit();
+  });
+
   joinForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const candidate = nicknameInput.value.trim();
@@ -1213,6 +1317,10 @@
 
     nickname = candidate;
     roomCode = roomCandidate;
+    createOptionsForJoin = joinIntent === "create"
+      ? { mode: roomModeInput.value, ttlSeconds: Number(roomTtlInput.value) }
+      : null;
+    joinIntent = "join";
     reconnectAttempts = 0;
     suppressReconnect = false;
     focusAfterHistory = true;
