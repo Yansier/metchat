@@ -60,7 +60,7 @@ $worker->count = (int) $config['worker_count'];
 $worker->onWorkerStart = static function () use ($room, $config): void {
     Timer::add((int) $config['heartbeat_check_interval'], static fn () => $room->closeStaleConnections());
     Timer::add((int) $config['history_cleanup_interval'], static fn () => $room->pruneExpiredMessages());
-    Timer::add((int) $config['room_lifecycle_cleanup_interval'], static fn () => $room->pruneExpiredMessages());
+    Timer::add((int) $config['room_lifecycle_cleanup_interval'], static fn () => $room->pruneRoomLifecycle());
     Timer::add((int) $config['typing_cleanup_interval'], static fn () => $room->pruneTypingStates());
 };
 $worker->onConnect = static fn (TcpConnection $connection) => $room->attach($connection);

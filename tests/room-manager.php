@@ -76,12 +76,16 @@ $lifecycleClock = static function () use (&$lifecycleNow): int {
 };
 $lifecycle = new RoomManager(5, 3, 50, 86_400, $lifecycleClock, str_repeat('G', 32), 30);
 
-$normal = $lifecycle->join('NormalRoom_1', 10, ['mode' => 'normal', 'ttlSeconds' => 600]);
+$creationRequestId = str_repeat('a', 32);
+$normal = $lifecycle->join('NormalRoom_1', 10, ['mode' => 'normal', 'ttlSeconds' => 600, 'requestId' => $creationRequestId]);
 checkRoom($normal['status'] === RoomManager::JOINED && $normal['created'] === true, 'Explicit normal room creation failed.');
 checkRoom($normal['roomMode'] === 'normal' && $normal['ttlSeconds'] === 600, 'Normal room configuration was not authoritative.');
 checkRoom(preg_match('/\A[a-f0-9]{32}\z/D', $normal['roomInstanceId']) === 1, 'Room instance ID format is invalid.');
 $normalConflict = $lifecycle->join('NormalRoom_1', 11, ['mode' => 'ghost', 'ttlSeconds' => 3_600]);
 checkRoom($normalConflict['status'] === RoomManager::ROOM_ALREADY_EXISTS, 'Existing room settings were overwritten by explicit creation.');
+$normalRecovered = $lifecycle->join('NormalRoom_1', 12, ['mode' => 'normal', 'ttlSeconds' => 600, 'requestId' => $creationRequestId]);
+checkRoom($normalRecovered['status'] === RoomManager::JOINED, 'Same creation request could not recover after a lost acknowledgement.');
+checkRoom($normalRecovered['roomInstanceId'] === $normal['roomInstanceId'], 'Creation recovery produced a different room instance.');
 $normalJoin = $lifecycle->join('NormalRoom_1', 11);
 checkRoom($normalJoin['roomInstanceId'] === $normal['roomInstanceId'], 'Ordinary join did not use the existing instance.');
 checkRoom($normalJoin['roomMode'] === 'normal' && $normalJoin['ttlSeconds'] === 600, 'Ordinary join changed room settings.');
@@ -89,6 +93,7 @@ $normalMessage = $lifecycle->addMessage($normal['roomKey'], 'Normal', 'ten-minut
 checkRoom($normalMessage['expiresAt'] === gmdate('c', $lifecycleNow + 600), 'Per-room TTL was not applied to a message.');
 $lifecycle->leave($normal['roomKey'], 10);
 $lifecycle->leave($normal['roomKey'], 11);
+$lifecycle->leave($normal['roomKey'], 12);
 checkRoom(count($lifecycle->history($normal['roomKey'])) === 1, 'Normal room history did not survive all members leaving.');
 
 $ghost = $lifecycle->join('GhostRoom_01', 20, ['mode' => 'ghost', 'ttlSeconds' => 3_600]);

@@ -4,4 +4,6 @@
 /server/bin/workerman.log
 /.idea/
 /.vscode/
+/.codex-php-*/
+/.codex-php-*.zip
 

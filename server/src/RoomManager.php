@@ -21,7 +21,7 @@ final class RoomManager
     /**
      * @var array<string, array{
      *   public_id: string, instance_id: string, mode: string, ttl_seconds: int,
-     *   created_at: int, empty_since: ?int, destroy_at: ?int,
+     *   created_at: int, creation_request_id: ?string, empty_since: ?int, destroy_at: ?int,
      *   members: array<int, true>, history: MessageHistory
      * }>
      */
@@ -55,7 +55,7 @@ final class RoomManager
 
     /**
      * Explicit create options apply only to a new room instance.
-     * @param null|array{mode: string, ttlSeconds: int} $createOptions
+     * @param null|array{mode: string, ttlSeconds: int, requestId?: string} $createOptions
      * @return array{status: string, roomKey?: string, roomId?: string, roomInstanceId?: string, roomMode?: string, ttlSeconds?: int, ghostGraceSeconds?: int, created?: bool}
      */
     public function join(string $roomCode, int $connectionId, ?array $createOptions = null): array
@@ -68,7 +68,15 @@ final class RoomManager
             unset($this->rooms[$roomKey]);
         }
         if (isset($this->rooms[$roomKey]) && $createOptions !== null) {
-            return ['status' => self::ROOM_ALREADY_EXISTS];
+            $room = $this->rooms[$roomKey];
+            $isRecoveringSameCreation = isset($createOptions['requestId'])
+                && $room['creation_request_id'] !== null
+                && hash_equals($room['creation_request_id'], $createOptions['requestId'])
+                && $room['mode'] === $createOptions['mode']
+                && $room['ttl_seconds'] === $createOptions['ttlSeconds'];
+            if (!$isRecoveringSameCreation) {
+                return ['status' => self::ROOM_ALREADY_EXISTS];
+            }
         }
 
         $created = false;
@@ -90,6 +98,7 @@ final class RoomManager
                 'mode' => $mode,
                 'ttl_seconds' => $ttlSeconds,
                 'created_at' => $now,
+                'creation_request_id' => $createOptions['requestId'] ?? null,
                 'empty_since' => null,
                 'destroy_at' => null,
                 'members' => [],
@@ -189,12 +198,26 @@ final class RoomManager
         return compact('expiredMessages', 'releasedRooms', 'destroyedGhostRooms');
     }
 
+    /** @return array{destroyedGhostRooms: int} */
+    public function pruneLifecycle(): array
+    {
+        $destroyedGhostRooms = 0;
+        $now = ($this->clock)();
+        foreach (array_keys($this->rooms) as $roomKey) {
+            if ($this->shouldDestroyGhost($roomKey, $now)) {
+                unset($this->rooms[$roomKey]);
+                ++$destroyedGhostRooms;
+            }
+        }
+        return ['destroyedGhostRooms' => $destroyedGhostRooms];
+    }
+
     private function keyForCode(string $roomCode): string
     {
         return hash_hmac('sha256', $roomCode, $this->roomHashKey);
     }
 
-    /** @return array{public_id: string, instance_id: string, mode: string, ttl_seconds: int, created_at: int, empty_since: ?int, destroy_at: ?int, members: array<int, true>, history: MessageHistory} */
+    /** @return array{public_id: string, instance_id: string, mode: string, ttl_seconds: int, created_at: int, creation_request_id: ?string, empty_since: ?int, destroy_at: ?int, members: array<int, true>, history: MessageHistory} */
     private function room(string $roomKey): array
     {
         if (!isset($this->rooms[$roomKey])) {

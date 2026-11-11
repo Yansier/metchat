@@ -236,6 +236,12 @@ final class ChatRoom
         return $this->rooms->pruneExpired();
     }
 
+    /** @return array{destroyedGhostRooms: int} */
+    public function pruneRoomLifecycle(): array
+    {
+        return $this->rooms->pruneLifecycle();
+    }
+
     public function pruneTypingStates(): void
     {
         $now = time();
@@ -296,12 +302,16 @@ final class ChatRoom
         $createOptions = null;
         if (array_key_exists('createOptions', $packet)) {
             $candidate = $packet['createOptions'];
+            if (array_is_list($candidate) || count($candidate) < 2 || count($candidate) > 3) {
+                $this->sendError($connection, 'invalid_create_options', '房间创建设置无效'); return;
+            }
+            if (!$this->hasOnlyKeys($candidate, ['mode', 'ttlSeconds', 'requestId'])) {
+                $this->sendError($connection, 'invalid_create_options', '房间创建设置无效'); return;
+            }
             if (
-                array_is_list($candidate)
-                || !$this->hasOnlyKeys($candidate, ['mode', 'ttlSeconds'])
-                || count($candidate) !== 2
-                || !is_string($candidate['mode'] ?? null)
+                !is_string($candidate['mode'] ?? null)
                 || !is_int($candidate['ttlSeconds'] ?? null)
+                || (array_key_exists('requestId', $candidate) && !is_string($candidate['requestId']))
             ) {
                 $this->sendError($connection, 'invalid_create_options', '房间创建设置无效'); return;
             }
@@ -311,7 +321,13 @@ final class ChatRoom
             if (!in_array($candidate['ttlSeconds'], RoomManager::ALLOWED_TTL_SECONDS, true)) {
                 $this->sendError($connection, 'invalid_room_ttl', '消息有效期无效'); return;
             }
+            if (isset($candidate['requestId']) && preg_match('/\A[a-f0-9]{32}\z/D', $candidate['requestId']) !== 1) {
+                $this->sendError($connection, 'invalid_create_request_id', '房间创建请求标识无效'); return;
+            }
             $createOptions = ['mode' => $candidate['mode'], 'ttlSeconds' => $candidate['ttlSeconds']];
+            if (isset($candidate['requestId'])) {
+                $createOptions['requestId'] = $candidate['requestId'];
+            }
         }
 
         $identityToken = is_string($packet['identityToken'] ?? null) ? $packet['identityToken'] : null;

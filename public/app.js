@@ -80,6 +80,7 @@
     invalid_create_options: "房间创建设置无效，请重新选择。",
     invalid_room_mode: "房间模式无效，请重新选择。",
     invalid_room_ttl: "消息有效期无效，请重新选择。",
+    invalid_create_request_id: "房间创建请求无效，请重新创建。",
     room_already_exists: "该暗号对应的房间已存在，请改为加入房间或使用其他暗号。",
   };
 
@@ -900,6 +901,21 @@
     switch (packet.type) {
       case "join":
         if (packet.self === true) {
+          const authoritativeMode = packet.roomMode === "ghost" ? "ghost" : "normal";
+          const authoritativeTtl = [600, 3_600, 86_400].includes(packet.ttlSeconds) ? packet.ttlSeconds : 86_400;
+          if (
+            createOptionsForJoin
+            && (authoritativeMode !== createOptionsForJoin.mode || authoritativeTtl !== createOptionsForJoin.ttlSeconds)
+          ) {
+            createOptionsForJoin = null;
+            suppressReconnect = true;
+            joinError.textContent = "服务器房间设置与本次创建请求不一致，已停止加入，未自动降级房间配置。";
+            setStatus("offline", "房间设置不一致");
+            joinButton.disabled = false;
+            createRoomButton.disabled = false;
+            sourceSocket.close();
+            break;
+          }
           const nextRoomInstanceId = typeof packet.roomInstanceId === "string"
             && /^[a-f0-9]{32}$/.test(packet.roomInstanceId)
             ? packet.roomInstanceId
@@ -909,8 +925,8 @@
             instanceChangedPending = true;
           }
           roomInstanceId = nextRoomInstanceId;
-          roomMode = packet.roomMode === "ghost" ? "ghost" : "normal";
-          roomTtlSeconds = [600, 3_600, 86_400].includes(packet.ttlSeconds) ? packet.ttlSeconds : 86_400;
+          roomMode = authoritativeMode;
+          roomTtlSeconds = authoritativeTtl;
           ghostGraceSeconds = Number.isInteger(packet.ghostGraceSeconds) && packet.ghostGraceSeconds > 0
             ? packet.ghostGraceSeconds
             : 30;
@@ -1317,9 +1333,20 @@
 
     nickname = candidate;
     roomCode = roomCandidate;
-    createOptionsForJoin = joinIntent === "create"
-      ? { mode: roomModeInput.value, ttlSeconds: Number(roomTtlInput.value) }
-      : null;
+    if (joinIntent === "create") {
+      try {
+        createOptionsForJoin = {
+          mode: roomModeInput.value,
+          ttlSeconds: Number(roomTtlInput.value),
+          requestId: generateRequestId(),
+        };
+      } catch {
+        joinError.textContent = "浏览器无法生成安全创建标识，请刷新后重试。";
+        return;
+      }
+    } else {
+      createOptionsForJoin = null;
+    }
     joinIntent = "join";
     reconnectAttempts = 0;
     suppressReconnect = false;

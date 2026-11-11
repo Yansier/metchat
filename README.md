@@ -1,6 +1,6 @@
 # Private Ephemeral Chat
 
-一个按共享暗号隔离房间、实时转发并在 PHP Workerman 进程内存中保留短期历史的轻量私人聊天室。每个房间最多保留最近 50 条、24 小时内的消息；不使用数据库、文件或浏览器持久化存储。Workerman 重启后所有房间和历史自然清空。
+一个按共享暗号隔离房间、实时转发并在 PHP Workerman 进程内存中保留短期历史的轻量私人聊天室。每个房间最多保留最近 50 条消息，可选择 10 分钟、1 小时或 24 小时有效期；不使用数据库、文件或浏览器消息持久化存储。Workerman 重启后所有房间和历史自然清空。
 
 前端采用无框架的深色响应式界面，包含明确的连接状态、权威在线连接列表、输入中提示、引用回复、历史加载、有限重连、主动退出、消息长度提示和“回到最新消息”。服务端签发仅限当前浏览器标签页会话的匿名身份凭证，并为每个房间派生不同的公开 `senderId`，因此实时消息和恢复历史都能准确区分自己与其他人，而不依赖昵称。
 
@@ -29,7 +29,8 @@ private-ephemeral-chat/
 │   └── vendor/                     # composer install 后生成
 ├── deploy/
 │   ├── nginx-private-chat.conf
-│   └── PHASE5B1-DEPLOY.md
+│   ├── PHASE5B1-DEPLOY.md
+│   └── PHASE5C-DEPLOY.md
 ├── tests/
 │   ├── integration.php
 │   ├── anonymous-identity.php
@@ -50,6 +51,7 @@ private-ephemeral-chat/
 ```json
 {"type":"join","nickname":"Alice","roomCode":"261110Achat"}
 {"type":"join","nickname":"Alice","roomCode":"261110Achat","identityToken":"可选的服务端签发凭证"}
+{"type":"join","nickname":"Alice","roomCode":"261110Achat","createOptions":{"mode":"ghost","ttlSeconds":600,"requestId":"32位客户端随机创建ID"}}
 {"type":"chat","text":"你好"}
 {"type":"chat","text":"你好","requestId":"32位客户端随机请求ID"}
 {"type":"chat","text":"我同意","replyToId":"32位服务端消息ID","requestId":"32位客户端随机请求ID"}
@@ -61,7 +63,7 @@ private-ephemeral-chat/
 
 服务端发送 `join`、`history`、`chat`、`chat_result`、`presence`、`members`、`typing`、`error`、`pong`。成功加入后的顺序为：
 
-1. `join`：加入确认，包含非敏感 `roomId`、房间专属 `senderId`、续期后的 `identityToken` 和凭证到期时间；完整暗号不会回传。
+1. `join`：加入确认，包含非敏感 `roomId`、随机 `roomInstanceId`、权威 `roomMode`/`ttlSeconds`/`ghostGraceSeconds`、房间专属 `senderId`、续期后的 `identityToken` 和凭证到期时间；完整暗号不会回传。
 2. `history`：从旧到新的有效历史快照。
 3. `presence` 和带递增 `version` 的 `members`：当前房间权威在线连接快照。
 4. 后续 `chat`、`typing`：当前房间实时事件。
@@ -71,6 +73,17 @@ private-ephemeral-chat/
 新客户端为每次发送生成 128 位随机 `requestId`。服务端仅在消息完成校验并加入内存历史后，向发起连接返回 `{"type":"chat_result","requestId":"…","ok":true,"messageId":"…","serverTime":"…"}`；可关联失败返回 `ok:false`、`code` 和 `message`。`requestId` 不进入广播或历史。旧客户端不带 `requestId` 时仍可按原协议发送并接收服务端 `chat` 回显。
 
 暗号规则：8–64 位，只允许英文字母、数字、下划线和连字符，区分大小写。服务端只把暗号转换为带进程随机密钥的内部哈希，不把完整暗号写入消息、URL 或日志。
+
+## 普通房间、幽灵房间与创建恢复
+
+- 不带 `createOptions` 的旧版 join 行为保持不变：存在则加入，不存在则创建普通房间，TTL 为 24 小时。
+- 显式创建只接受 `mode` 为 `normal`/`ghost`，`ttlSeconds` 为 `600`、`3600`、`86400`。房间实例创建后配置不可修改。
+- 普通房间在全员离线后继续保留未过期历史；成员和有效历史都为空后释放。
+- 幽灵房间在最后一条真实服务端连接释放后开始 30 秒宽限。宽限内成功加入会取消销毁；期限届满仍无人在线则清空历史和配置并释放房间。
+- `roomInstanceId` 是每次真正创建房间时生成的 128 位随机标识。同一暗号的幽灵房间销毁后再加入会获得新实例 ID；它只用于生命周期区分，不是认证凭证。
+- 新客户端为显式创建生成随机 `createOptions.requestId`，并在收到 join 确认前为有限重连复用同一个 ID。服务端仅允许同一请求 ID、相同 mode/TTL 恢复已创建实例；其他创建请求仍返回 `room_already_exists`。
+- 客户端恢复后还会核对 join 返回的权威 mode/TTL；不一致时停止加入，不会静默降级成普通房间。`requestId` 不广播、不写入历史，也不提供房间授权。
+- 若重连发现 `roomInstanceId` 已变化，客户端清理旧实例的消息 DOM、Set/Map、引用和输入状态，再应用新实例历史；未确认发送的草稿和“结果未知”提示仍保留且不会自动重发。
 
 加入页可以用 Web Crypto `crypto.getRandomValues()` 生成默认 24 位暗号。字符集正好兼容服务端规则，并使用拒绝采样避免取模偏差；生成操作只填入表单，不会自动加入或保存暗号。
 
@@ -138,9 +151,13 @@ php tests/room-manager.php
 php tests/anonymous-identity.php
 php tests/security-unit.php
 php tests/integration.php
+php tests/integration.php phase5c
+php tests/integration.php phase5c-create-recovery
 ```
 
 测试覆盖凭证签名/伪造/续期/过期/重启失效、同昵称身份分离、权威成员快照、旧/新连接重叠清理、输入状态隔离/过期/限流、引用验证/恢复/过期降级、房间专属 senderId、跨房间实时/历史隔离、每房间独立 50 条历史、未加入越权、限流和容量。
+
+Phase 5C 的可控时钟单元测试覆盖普通/幽灵状态机、三种 TTL、30 秒销毁边界、容量释放和实例更新。真实 Workerman 创建确认丢失回归使用 `phase5c-create-recovery`：首次连接发送创建请求后不读取 join 确认，再以相同创建请求重连，确认仍进入同一实例和相同配置。
 
 短 TTL 的真实 Workerman 生命周期测试可用测试环境变量运行（不要用于生产）：
 
@@ -186,6 +203,8 @@ powershell -ExecutionPolicy Bypass -File tests/static-checks.ps1
 19. 在移动端点击回复、取消回复和成员入口，确认底部抽屉及软键盘不会遮挡输入框。
 20. 发送后立刻断开 WebSocket，确认草稿保留、提示结果未知且不会自动重发；等待确认时重复按 Enter 不得产生第二个请求。
 21. 使用测试环境的短 TTL，将页面切到后台后再恢复，确认过期消息及其 Map/Set/DOM 状态被清理，仍有效的引用回复只降级引用摘要而不被删除。
+22. 分别创建普通/幽灵房间和三种 TTL，确认聊天页只显示服务端确认的配置；已有房间不能被第二次创建覆盖。
+23. 幽灵房间最后一条连接退出后，在 30 秒内重进应保留实例和历史；超过宽限后同暗号应显示新 `roomInstanceId` 对应的新会话且无旧历史。
 
 消息交互约定：Enter 发送，Shift+Enter 换行。客户端只显示服务端回显的消息，不做乐观伪发送，也不会自动重试未确认的消息。
 
@@ -223,9 +242,9 @@ php bin/chat-server.php start -d
 - 在线成员、输入状态和成员/输入事件序列只存在 Worker 内存中，不写入消息历史。
 - 房间状态只存在单 Worker 进程的 `RoomManager` 数组中。
 - 每个房间拥有独立 `MessageHistory`，最多 50 条。
-- 每 60 秒定时清理过期消息；每次返回历史前也会再次过滤。
+- 每 60 秒扫描并清理过期消息；每次返回历史前也会再次过滤。独立的 1 秒生命周期检查只检查幽灵房间销毁期限，不重复扫描消息历史。
 - 前端每 60 秒并在页面恢复可见时，按 `serverTime` 锚点和消息 `expiresAt` 清理过期气泡，同时删除对应 Set/Map 引用并刷新引用摘要。
-- 房间无人在线但仍有有效历史时继续保留；无成员且无历史时释放房间。
+- 普通房间无人在线但仍有有效历史时继续保留；无成员且无历史时释放。幽灵房间宽限期间仍计入 100 个房间容量上限。
 - 聊天正文不写入控制台或应用日志。
 - 完整暗号不进入聊天正文、服务端响应、URL 或应用日志。
 - 页面刷新会销毁 DOM，重新加入后从服务器恢复有效历史。

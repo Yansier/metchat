@@ -319,7 +319,9 @@ if ($mode === 'phase5c') {
     $phaseClients = [];
     try {
         $normalCreator = $phaseClients[] = new TestWebSocket();
-        $normal = joinClient($normalCreator, 'NormalCreator', $normalCode, null, ['mode' => 'normal', 'ttlSeconds' => 600]);
+        $normal = joinClient($normalCreator, 'NormalCreator', $normalCode, null, [
+            'mode' => 'normal', 'ttlSeconds' => 600, 'requestId' => bin2hex(random_bytes(16)),
+        ]);
         check($normal['roomMode'] === 'normal' && $normal['ttlSeconds'] === 600, 'Custom normal configuration was not applied.');
 
         $conflict = $phaseClients[] = new TestWebSocket();
@@ -396,8 +398,53 @@ if ($mode === 'phase5c-heartbeat') {
     exit(0);
 }
 
+if ($mode === 'phase5c-create-recovery') {
+    $suffix = bin2hex(random_bytes(4));
+    $roomCode = "CreateRecovery_{$suffix}";
+    $requestId = bin2hex(random_bytes(16));
+    $options = ['mode' => 'ghost', 'ttlSeconds' => 600, 'requestId' => $requestId];
+    $creator = new TestWebSocket();
+    $observer = null;
+    $reconnected = null;
+    $conflict = null;
+    try {
+        $creator->send([
+            'type' => 'join', 'nickname' => 'Creator', 'roomCode' => $roomCode,
+            'createOptions' => $options,
+        ]);
+        // Deliberately do not read the acknowledgement: from the client view the result is unknown.
+        usleep(500_000);
+        $observer = new TestWebSocket();
+        $observed = joinClient($observer, 'Observer', $roomCode);
+        check(
+            $observed['roomMode'] === 'ghost' && $observed['ttlSeconds'] === 600,
+            'Observer saw incorrect created-room configuration: ' . json_encode([$observed['roomMode'], $observed['ttlSeconds']]),
+        );
+        $creator->close();
+
+        $reconnected = new TestWebSocket();
+        $recovered = joinClient($reconnected, 'Creator', $roomCode, null, $options);
+        check($recovered['roomInstanceId'] === $observed['roomInstanceId'], 'Lost creation acknowledgement caused a duplicate room instance.');
+        check($recovered['roomMode'] === 'ghost' && $recovered['ttlSeconds'] === 600, 'Recovered creation silently changed room configuration.');
+
+        $conflict = new TestWebSocket();
+        $conflict->send([
+            'type' => 'join', 'nickname' => 'Conflict', 'roomCode' => $roomCode,
+            'createOptions' => ['mode' => 'ghost', 'ttlSeconds' => 600, 'requestId' => bin2hex(random_bytes(16))],
+        ]);
+        check(($conflict->expect('error')['code'] ?? null) === 'room_already_exists', 'A different creation request reused an existing room.');
+        echo "PASS: lost creation acknowledgement reconnects to the same authoritative room without duplicate creation or config downgrade.\n";
+    } finally {
+        $conflict?->close();
+        $reconnected?->close();
+        $observer?->close();
+        $creator->close();
+    }
+    exit(0);
+}
+
 if ($mode !== 'full') {
-    throw new InvalidArgumentException('Mode must be full, seed-restart, verify-restart, identity-restart, phase5c, or phase5c-heartbeat.');
+    throw new InvalidArgumentException('Mode must be full, restart modes, phase5c, phase5c-heartbeat, or phase5c-create-recovery.');
 }
 
 $clients = [];
